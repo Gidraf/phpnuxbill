@@ -643,6 +643,43 @@ function cvpap_act_active_recharges($q)
 
 /* ------------------------------------------------------- shared internals */
 
+/**
+ * Connectivity probe for one router: quick TCP check (5 s) before the
+ * RouterOS API login, so offline routers don't hang for the full socket
+ * timeout.
+ */
+function cvpap_router_probe($name)
+{
+    $router = Mikrotik::info($name);
+    if (!$router) {
+        return ['name' => $name, 'online' => false, 'error' => 'Router not found'];
+    }
+    if (isset($router['enabled']) && !$router['enabled']) {
+        return ['name' => $name, 'online' => false, 'error' => 'Router disabled'];
+    }
+    $iport = explode(':', $router['ip_address']);
+    $host = $iport[0];
+    $port = isset($iport[1]) && $iport[1] !== '' ? (int) $iport[1] : 8728;
+
+    $errno = 0;
+    $errstr = '';
+    $sock = @fsockopen($host, $port, $errno, $errstr, 5);
+    if ($sock === false) {
+        return ['name' => $name, 'online' => false, 'error' => "tcp $host:$port unreachable: $errstr"];
+    }
+    fclose($sock);
+
+    try {
+        $client = Mikrotik::getClient($router['ip_address'], $router['username'], $router['password']);
+        if ($client === null) { // demo mode
+            return ['name' => $name, 'online' => false, 'error' => 'demo mode'];
+        }
+        return ['name' => $name, 'online' => true, 'error' => ''];
+    } catch (Throwable $e) {
+        return ['name' => $name, 'online' => false, 'error' => $e->getMessage()];
+    }
+}
+
 function cvpap_router_find($q)
 {
     $r = null;
