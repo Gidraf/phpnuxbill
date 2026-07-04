@@ -62,25 +62,21 @@ if ($step == 1) {
         $step = 0;
     }
 } else if ($step == 2) {
-    $username = _post('username');
-    $otp_code = _post('otp_code');
+    // CVPAP: verify the code (typed OR from an emailed link — _req accepts
+    // GET) and show a "choose your new password" form instead of generating
+    // a random password on screen
+    $username = _req('username');
+    $otp_code = _req('otp_code');
     if (!empty($username) && !empty($otp_code)) {
         $otpPath .= sha1($username . $db_pass) . ".txt";
-        if (file_exists($otpPath) && time() - filemtime($otpPath) <= 600) {
+        if (file_exists($otpPath) && time() - filemtime($otpPath) <= 1200) {
             $otp = file_get_contents($otpPath);
             if ($otp == $otp_code) {
-                $pass = mt_rand(10000, 99999);
-                $user = ORM::for_table('tbl_customers')->where('username', $username)->find_one();
-                $user->password = $pass;
-                $user->save();
                 $ui->assign('username', $username);
-                $ui->assign('passsword', $pass);
-                $ui->assign('notify_t', 's');
-                $ui->assign('notify', Lang::T("Verification Code Valid"));
-                if (file_exists($otpPath)) {
-                    unlink($otpPath);
-                }
-                setcookie('forgot_username', '', time() - 3600, '/');
+                $ui->assign('otp_code', $otp_code);
+                $ui->assign('_title', Lang::T('Change Password'));
+                $ui->display('customer/forgot-set-password.tpl');
+                exit();
             } else {
                 r2(getUrl('forgot&step=1'), 'e', Lang::T('Invalid Username or Verification Code'));
             }
@@ -93,6 +89,48 @@ if ($step == 1) {
     } else {
         r2(getUrl('forgot&step=1'), 'e', Lang::T('Invalid Username or Verification Code'));
     }
+} else if ($step == 3) {
+    // CVPAP: save the customer-chosen password (token consumed here)
+    $username = _post('username');
+    $otp_code = _post('otp_code');
+    $password = _post('password');
+    $cpassword = _post('cpassword');
+    $otpPath .= sha1($username . $db_pass) . ".txt";
+    $valid = !empty($username) && !empty($otp_code)
+        && file_exists($otpPath) && time() - filemtime($otpPath) <= 1200
+        && file_get_contents($otpPath) == $otp_code;
+    if (!$valid) {
+        if (file_exists($otpPath)) {
+            unlink($otpPath);
+        }
+        r2(getUrl('forgot&step=1'), 'e', Lang::T('Invalid Username or Verification Code'));
+    }
+    if (!Validator::Length($password, 36, 5)) {
+        $ui->assign('username', $username);
+        $ui->assign('otp_code', $otp_code);
+        $ui->assign('notify', Lang::T('Password should be between 6 to 35 characters'));
+        $ui->assign('notify_t', 'd');
+        $ui->assign('_title', Lang::T('Change Password'));
+        $ui->display('customer/forgot-set-password.tpl');
+        exit();
+    }
+    if ($password != $cpassword) {
+        $ui->assign('username', $username);
+        $ui->assign('otp_code', $otp_code);
+        $ui->assign('notify', Lang::T('Passwords does not match'));
+        $ui->assign('notify_t', 'd');
+        $ui->assign('_title', Lang::T('Change Password'));
+        $ui->display('customer/forgot-set-password.tpl');
+        exit();
+    }
+    $user = ORM::for_table('tbl_customers')->where('username', $username)->find_one();
+    if ($user) {
+        $user->password = $password;
+        $user->save();
+    }
+    unlink($otpPath);
+    setcookie('forgot_username', '', time() - 3600, '/');
+    r2(getUrl('login'), 's', Lang::T('Password changed successfully, you can login now'));
 } else if ($step == 7) {
     $find = _post('find');
     $step = 6;

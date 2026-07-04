@@ -429,6 +429,93 @@ function cvpap_act_customer_update($q)
     return ['id' => $c['id'], 'username' => $c['username']];
 }
 
+/* ----------------------------------------------------- passwords & welcome */
+
+/**
+ * Generate a set/reset-password link for a customer (no passwords by email).
+ */
+function cvpap_act_password_link($q)
+{
+    cvpap_require_params($q, ['username']);
+    $c = ORM::for_table('tbl_customers')->where('username', $q['username'])->find_one();
+    if (!$c) {
+        throw new CvpapApiError('Customer not found');
+    }
+    return ['link' => cvpap_password_reset_link($c['username']), 'expires_minutes' => 20];
+}
+
+/**
+ * Send the styled welcome email with a set-password link. Requires the
+ * customer to have an email (pass one to set it at the same time).
+ */
+function cvpap_act_send_welcome($q)
+{
+    global $config;
+    cvpap_require_params($q, ['username']);
+    $c = ORM::for_table('tbl_customers')->where('username', $q['username'])->find_one();
+    if (!$c) {
+        throw new CvpapApiError('Customer not found');
+    }
+    if (!empty($q['email']) && $q['email'] != $c['email']) {
+        $c->email = $q['email'];
+        $c->save();
+    }
+    if (empty($c['email'])) {
+        return ['sent' => false, 'reason' => 'customer has no email'];
+    }
+    $reset = cvpap_password_reset_link($c['username']);
+    $portal = APP_URL . '/?_route=login';
+    $html = cvpap_welcome_html(
+        $config['CompanyName'],
+        $c['fullname'],
+        $c['username'],
+        $portal,
+        $reset
+    );
+    Message::sendEmail($c['email'], 'Welcome to ' . $config['CompanyName'] . '! 🎉', $html);
+    return ['sent' => true, 'to' => $c['email']];
+}
+
+/* ---------------------------------------------------------------- partners */
+
+/**
+ * Upsert a CVPAP partner as a nuxbill Agent (tbl_users) so partners share
+ * one login across both systems. Password is optional — when CVPAP has the
+ * plaintext (set/reset moments) it passes it along and we store sha1 like
+ * nuxbill does natively.
+ */
+function cvpap_act_partner_upsert($q)
+{
+    cvpap_require_params($q, ['username']);
+    $u = ORM::for_table('tbl_users')->where('username', $q['username'])->find_one();
+    $created = false;
+    if (!$u) {
+        $u = ORM::for_table('tbl_users')->create();
+        $u->username = $q['username'];
+        $u->user_type = cvpap_param($q, 'user_type', 'Agent');
+        $u->status = 'Active';
+        $u->creationdate = date('Y-m-d H:i:s');
+        // unusable random password until CVPAP pushes the real one
+        $u->password = Password::_crypt(bin2hex(random_bytes(16)));
+        $created = true;
+    }
+    foreach (['fullname', 'email', 'phone'] as $field) {
+        if (!empty($q[$field])) {
+            $u->$field = $q[$field];
+        }
+    }
+    if (!empty($q['password'])) {
+        $u->password = Password::_crypt($q['password']);
+    }
+    if (isset($q['status']) && in_array($q['status'], ['Active', 'Inactive'])) {
+        $u->status = $q['status'];
+    }
+    $u->save();
+    cvpap_meta_tag('tbl_users', $u->id(), $q);
+    return ['id' => $u->id(), 'username' => $u['username'],
+            'user_type' => $u['user_type'], 'created' => $created];
+}
+
 /* -------------------------------------------------------------- recharge */
 
 /**

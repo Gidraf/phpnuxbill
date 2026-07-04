@@ -171,6 +171,68 @@ function cvpap_meta_get($tbl, $tbl_id)
     return $m ? $m['value'] : '';
 }
 
+/* ------------------------------------------------- password links & email */
+
+/**
+ * Create a set/reset-password link for a customer. Reuses the forgot-password
+ * token store, so the link lands on the "choose a new password" form.
+ * Valid 20 minutes.
+ */
+function cvpap_password_reset_link($username)
+{
+    global $CACHE_PATH, $db_pass;
+    $dir = $CACHE_PATH . File::pathFixer('/forgot/');
+    if (!file_exists($dir)) {
+        mkdir($dir);
+    }
+    $otp = mt_rand(100000, 999999);
+    file_put_contents($dir . sha1($username . $db_pass) . ".txt", $otp);
+    return APP_URL . '/?_route=forgot&step=2&username=' . urlencode($username) . '&otp_code=' . $otp;
+}
+
+/**
+ * Colorful tech-styled welcome email (inline CSS — email-client safe).
+ * No temporary passwords: the CTA is a set-your-password link.
+ */
+function cvpap_welcome_html($brand, $fullname, $username, $portal_url, $reset_link)
+{
+    $name = htmlspecialchars($fullname ?: $username);
+    $user = htmlspecialchars($username);
+    $b = htmlspecialchars($brand);
+    return '
+<!DOCTYPE html>
+<html><body style="margin:0;padding:0;background:#0f172a;font-family:Segoe UI,Roboto,Arial,sans-serif;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#0f172a;padding:32px 12px;">
+<tr><td align="center">
+<table role="presentation" width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;">
+  <tr><td style="background:linear-gradient(135deg,#2563eb,#7c3aed,#db2777);border-radius:16px 16px 0 0;padding:36px 32px;text-align:center;">
+    <div style="font-size:44px;line-height:1;">&#128246;</div>
+    <h1 style="color:#ffffff;margin:12px 0 4px;font-size:26px;letter-spacing:0.5px;">Welcome to ' . $b . '!</h1>
+    <p style="color:#dbeafe;margin:0;font-size:15px;">Fast internet. Zero hassle. You&rsquo;re in, ' . $name . ' &#127881;</p>
+  </td></tr>
+  <tr><td style="background:#ffffff;padding:32px;">
+    <p style="color:#0f172a;font-size:15px;margin:0 0 18px;">Your account is ready. One last step &mdash; choose your own password (we never send passwords by email):</p>
+    <table role="presentation" cellpadding="0" cellspacing="0" width="100%"><tr><td align="center" style="padding:6px 0 22px;">
+      <a href="' . $reset_link . '" style="display:inline-block;background:linear-gradient(135deg,#2563eb,#7c3aed);color:#ffffff;text-decoration:none;font-weight:700;font-size:16px;padding:14px 36px;border-radius:10px;">&#128273; Set My Password</a>
+    </td></tr></table>
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f1f5f9;border-radius:12px;">
+      <tr><td style="padding:16px 20px;">
+        <p style="margin:0 0 6px;color:#64748b;font-size:12px;text-transform:uppercase;letter-spacing:1px;">Your login details</p>
+        <p style="margin:0;color:#0f172a;font-size:15px;">Portal: <a href="' . $portal_url . '" style="color:#2563eb;">' . $portal_url . '</a></p>
+        <p style="margin:4px 0 0;color:#0f172a;font-size:15px;">Username: <b>' . $user . '</b></p>
+        <p style="margin:4px 0 0;color:#0f172a;font-size:15px;">Password: <i>set it with the button above</i> &#128077;</p>
+      </td></tr>
+    </table>
+    <p style="color:#64748b;font-size:13px;margin:20px 0 0;">The link is valid for 20 minutes. Missed it? Use &ldquo;Forgot password&rdquo; on the portal to get a new one anytime.</p>
+  </td></tr>
+  <tr><td style="background:#0f172a;border-radius:0 0 16px 16px;padding:20px 32px;text-align:center;">
+    <p style="color:#94a3b8;font-size:12px;margin:0;">Need help? Just reply to this email &mdash; the ' . $b . ' team is here for you.</p>
+  </td></tr>
+</table>
+</td></tr></table>
+</body></html>';
+}
+
 /* ------------------------------------------------------------- webhooks */
 
 /**
