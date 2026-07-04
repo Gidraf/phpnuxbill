@@ -85,6 +85,16 @@ switch ($do) {
             $msg .= Lang::T('Account already exists') . '<br>';
         }
 
+        // CVPAP: email OTP — identifier was an email, capture it as the
+        // account email (it was just verified by the code)
+        $email_verified = false;
+        if ($_c['sms_otp_registration'] == 'yes' && strpos($phone_number, '@') !== false) {
+            if (empty($email)) {
+                $email = $phone_number;
+            }
+            $email_verified = ($email == $phone_number);
+        }
+
         if ($msg == '') {
             $d = ORM::for_table('tbl_customers')->create();
             $d->username = alphanumeric($username, "+_.@-");
@@ -116,6 +126,14 @@ switch ($do) {
                 if (file_exists($_FILES['photo']['tmp_name']))
                     unlink($_FILES['photo']['tmp_name']);
                 User::setFormCustomField($user);
+                // CVPAP: record the email verification proven by the OTP
+                if ($email_verified) {
+                    $fl = ORM::for_table('tbl_customers_fields')->create();
+                    $fl->customer_id = $user;
+                    $fl->field_name = 'Email Verified';
+                    $fl->field_value = 'yes';
+                    $fl->save();
+                }
                 run_hook('register_user'); #HOOK
                 $msg .= Lang::T('Registration successful') . '<br>';
                 if ($config['reg_nofify_admin'] == 'yes') {
@@ -144,7 +162,8 @@ switch ($do) {
             $ui->assign('notify_t', 'd');
             $ui->assign('_title', Lang::T('Register'));
             // Check if OTP is enabled
-            if (!empty($config['sms_url']) && $_c['sms_otp_registration'] == 'yes') {
+            // CVPAP: don't require an SMS gateway — email OTP works without one
+            if ($_c['sms_otp_registration'] == 'yes') {
                 // Display register-otp.tpl if OTP is enabled
                 $ui->display('customer/register-otp.tpl');
             } else {
@@ -213,7 +232,15 @@ switch ($do) {
                 } else {
                     $otp = rand(100000, 999999);
                     file_put_contents($otpPath, $otp);
-                    if ($config['phone_otp_type'] == 'whatsapp') {
+                    // CVPAP: email OTP — an email address as identifier gets the
+                    // code by email (doubles as email verification on signup)
+                    if (strpos($phone_number, '@') !== false) {
+                        Message::sendEmail(
+                            $phone_number,
+                            $config['CompanyName'] . ' - ' . Lang::T("Registration code"),
+                            Lang::T("Registration code") . ': <b>' . $otp . '</b>'
+                        );
+                    } else if ($config['phone_otp_type'] == 'whatsapp') {
                         Message::sendWhatsapp($phone_number, $config['CompanyName'] . "\n\n" . Lang::T("Registration code") . "\n$otp");
                     } else if ($config['phone_otp_type'] == 'both') {
                         Message::sendWhatsapp($phone_number, $config['CompanyName'] . "\n\n" . Lang::T("Registration code") . "\n$otp");
@@ -222,7 +249,9 @@ switch ($do) {
                         Message::sendSMS($phone_number, $config['CompanyName'] . "\n\n" . Lang::T("Registration code") . "\n$otp");
                     }
                     $ui->assign('phone_number', $phone_number);
-                    $ui->assign('notify', 'Registration code has been sent to your phone');
+                    $ui->assign('notify', strpos($phone_number, '@') !== false
+                        ? 'Registration code has been sent to your email'
+                        : 'Registration code has been sent to your phone');
                     $ui->assign('notify_t', 's');
                     $ui->assign('_title', Lang::T('Register'));
                     $ui->assign('customFields', User::getFormCustomField($ui, true));
