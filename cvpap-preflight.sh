@@ -189,13 +189,17 @@ elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     bad "container cannot reach host:3306" \
         "check bind-address, and: ufw allow from 172.16.0.0/12 to any port 3306"
   fi
-  if docker run --rm $net_opt --add-host host.docker.internal:host-gateway \
-       -e P="$DB_PASS" php:7.4-cli sh -c \
-       'php -r "new PDO(\"mysql:host=host.docker.internal;dbname='"$DB_NAME"'\", \"'"$DB_USER"'\", getenv(\"P\"));" ' >/dev/null 2>&1; then
+  # NOTE: uses the mariadb image (client included). Plain php images lack
+  # pdo_mysql — the nuxbill Dockerfile installs it at build time.
+  login_out=$(docker run --rm $net_opt --add-host host.docker.internal:host-gateway \
+       -e P="$DB_PASS" mariadb:11 sh -c \
+       "mariadb --connect-timeout=5 -h host.docker.internal -u $DB_USER -p\"\$P\" $DB_NAME -e 'SELECT 1'" 2>&1)
+  if [ $? -eq 0 ]; then
     ok "full login as '$DB_USER' from a container works (exactly what nuxbill does)"
   else
     bad "container login as '$DB_USER' failed" \
         "verify password + grants for '$DB_USER'@'172.%' (section 4 fixes)"
+    printf '        error: %s\n' "$(echo "$login_out" | tail -1)"
   fi
 else
   warn "docker unavailable — container connectivity test skipped"
