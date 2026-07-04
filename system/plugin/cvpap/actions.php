@@ -273,11 +273,15 @@ function cvpap_act_plan_create($q)
     $p->type = 'Hotspot';
     $p->typebp = cvpap_param($q, 'typebp', 'Unlimited');
     $p->plan_type = cvpap_param($q, 'plan_type', 'Business');
-    $p->limit_type = cvpap_param($q, 'limit_type', '');
-    $p->time_limit = cvpap_param($q, 'time_limit', 0);
-    $p->time_unit = cvpap_param($q, 'time_unit', 'Hrs');
-    $p->data_limit = cvpap_param($q, 'data_limit', 0);
-    $p->data_unit = cvpap_param($q, 'data_unit', 'MB');
+    // limit fields are nullable ENUMs — only set them for Limited plans
+    // (strict-mode MariaDB rejects '' with "Data truncated")
+    if ($p->typebp == 'Limited') {
+        $p->limit_type = cvpap_param($q, 'limit_type', 'Time_Limit');
+        $p->time_limit = cvpap_param($q, 'time_limit', 0);
+        $p->time_unit = cvpap_param($q, 'time_unit', 'Hrs');
+        $p->data_limit = cvpap_param($q, 'data_limit', 0);
+        $p->data_unit = cvpap_param($q, 'data_unit', 'MB');
+    }
     $p->validity = $q['validity'];
     $p->validity_unit = $q['validity_unit'];
     $p->shared_users = cvpap_param($q, 'shared_users', 1);
