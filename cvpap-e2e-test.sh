@@ -16,14 +16,20 @@ if ! command -v mysql >/dev/null 2>&1; then
   exit 2
 fi
 
-API_KEY=$(mysql nuxbill -N -e "SELECT value FROM tbl_appconfig WHERE setting='api_key' LIMIT 1;")
+# de-duplicate settings rows (keep the newest — matches how the app reads
+# config: later rows win), otherwise wrapper and plugin can disagree
+mysql nuxbill -e "DELETE t1 FROM tbl_appconfig t1
+  JOIN tbl_appconfig t2 ON t1.setting = t2.setting AND t1.id < t2.id
+  WHERE t1.setting IN ('api_key','cvpap_shared_secret');"
+
+API_KEY=$(mysql nuxbill -N -e "SELECT value FROM tbl_appconfig WHERE setting='api_key' ORDER BY id DESC LIMIT 1;")
 if [ -z "$API_KEY" ]; then
   API_KEY=$(openssl rand -hex 20)
   mysql nuxbill -e "INSERT INTO tbl_appconfig (setting, value) VALUES ('api_key', '$API_KEY');"
   echo "api_key was missing — generated and saved one."
 fi
 
-SECRET=$(mysql nuxbill -N -e "SELECT value FROM tbl_appconfig WHERE setting='cvpap_shared_secret' LIMIT 1;")
+SECRET=$(mysql nuxbill -N -e "SELECT value FROM tbl_appconfig WHERE setting='cvpap_shared_secret' ORDER BY id DESC LIMIT 1;")
 if [ -z "$SECRET" ]; then
   SECRET=$(openssl rand -hex 32)
   mysql nuxbill -e "INSERT INTO tbl_appconfig (setting, value) VALUES ('cvpap_shared_secret', '$SECRET');"
