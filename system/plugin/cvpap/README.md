@@ -37,6 +37,10 @@ Kept to an absolute minimum and marked with `// CVPAP` comments:
   address entered as the OTP identifier receives the code by email (serves
   as email verification; recorded as customer field "Email Verified"), and
   the OTP template no longer requires an SMS gateway to be configured.
+- `system/controllers/forgot.php` — link-based password reset: step 2
+  accepts GET (emailed links) and shows a choose-your-own-password form
+  (new step 3 + additive template `customer/forgot-set-password.tpl`)
+  instead of printing a random password on screen.
 
 If an upstream merge conflicts in these files, re-apply the `// CVPAP`
 blocks — each is a few self-contained lines.
