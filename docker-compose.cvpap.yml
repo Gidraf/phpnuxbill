@@ -23,8 +23,11 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"   # reach the VM's MariaDB
     volumes:
-      - ./system/uploads:/var/www/html/system/uploads
-      - ./config.php:/var/www/html/config.php
+      # data lives on the big volume; source code stays on the system disk.
+      # Seed uploads once from the repo before first start:
+      #   rsync -a --ignore-existing system/uploads/ /mnt/HC_Volume_103347833/nuxbill/uploads/
+      - /mnt/HC_Volume_103347833/nuxbill/uploads:/var/www/html/system/uploads
+      - /mnt/HC_Volume_103347833/nuxbill/config.php:/var/www/html/config.php
 
 networks:
   default:
