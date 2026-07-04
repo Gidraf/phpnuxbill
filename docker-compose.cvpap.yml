@@ -1,0 +1,32 @@
+# phpNuxBill — CVPAP deployment compose
+#
+# The database is NOT a container: phpNuxBill uses the VM's own MariaDB/MySQL
+# (survives container rebuilds, joins host backups). See
+# CVPAP/docs/WIFI_NUXBILL_DEPLOYMENT.md §1a for the host DB setup:
+#   - database `nuxbill`, user 'nuxbill'@'172.%'
+#   - bind-address 0.0.0.0 + firewall: 3306 allowed only from 172.16.0.0/12
+#
+# In the web installer use DB host `host.docker.internal`.
+#
+# The container joins CVPAP's compose network so the CVPAP backend reaches it
+# at http://nuxbill/system/api.php without publishing the API anywhere.
+
+services:
+  nuxbill:
+    container_name: nuxbill
+    build: ./
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:39090:80"   # admin UI: loopback-only, access via SSH tunnel
+    environment:
+      TZ: Africa/Nairobi
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # reach the VM's MariaDB
+    volumes:
+      - ./system/uploads:/var/www/html/system/uploads
+      - ./config.php:/var/www/html/config.php
+
+networks:
+  default:
+    name: cvpap_app-network    # ← CVPAP's network (`docker network ls | grep app-network`)
+    external: true
