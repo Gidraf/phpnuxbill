@@ -193,7 +193,7 @@ elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
   # pdo_mysql — the nuxbill Dockerfile installs it at build time.
   login_out=$(docker run --rm $net_opt --add-host host.docker.internal:host-gateway \
        -e P="$DB_PASS" mariadb:11 sh -c \
-       "mariadb --connect-timeout=5 -h host.docker.internal -u $DB_USER -p\"\$P\" $DB_NAME -e 'SELECT 1'" 2>&1)
+       "mariadb --skip-ssl --connect-timeout=5 -h host.docker.internal -u $DB_USER -p\"\$P\" $DB_NAME -e 'SELECT 1'" 2>&1)
   if [ $? -eq 0 ]; then
     ok "full login as '$DB_USER' from a container works (exactly what nuxbill does)"
   else
