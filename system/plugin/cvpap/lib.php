@@ -34,6 +34,180 @@ function cvpap_save_cfg($key, $value)
     $config[$key] = $value;
 }
 
+function cvpap_platform_config_defaults()
+{
+    return [
+        'advanced_settings_owner' => 'superadmin',
+        'communications_owner' => 'cvpap',
+        'billing_owner' => 'superadmin',
+        'partner_access' => ['routers', 'customers', 'logs'],
+    ];
+}
+
+function cvpap_platform_config()
+{
+    $defaults = cvpap_platform_config_defaults();
+    $raw = cvpap_cfg('cvpap_platform_config_json', '');
+    if ($raw == '') {
+        return $defaults;
+    }
+    $decoded = json_decode($raw, true);
+    if (!is_array($decoded)) {
+        return $defaults;
+    }
+    $cfg = array_merge($defaults, $decoded);
+    if (!is_array($cfg['partner_access'])) {
+        $cfg['partner_access'] = $defaults['partner_access'];
+    }
+    $cfg['partner_access'] = array_values(array_unique(array_filter(array_map('strval', $cfg['partner_access']))));
+    return $cfg;
+}
+
+function cvpap_save_platform_config($input)
+{
+    $current = cvpap_platform_config();
+    $cfg = is_array($input) ? array_merge($current, $input) : $current;
+
+    $owners = ['superadmin', 'partner'];
+    foreach (['advanced_settings_owner', 'communications_owner', 'billing_owner'] as $key) {
+        if (!empty($cfg[$key])) {
+            $val = strtolower(trim((string) $cfg[$key]));
+            if (in_array($val, $owners)) {
+                $cfg[$key] = $val;
+            } else {
+                $cfg[$key] = $current[$key];
+            }
+        } else {
+            $cfg[$key] = $current[$key];
+        }
+    }
+
+    if (isset($cfg['partner_access']) && is_string($cfg['partner_access'])) {
+        $cfg['partner_access'] = array_filter(array_map('trim', explode(',', $cfg['partner_access'])));
+    }
+    if (!isset($cfg['partner_access']) || !is_array($cfg['partner_access'])) {
+        $cfg['partner_access'] = $current['partner_access'];
+    }
+    $allowed_partner_access = ['routers', 'customers', 'logs'];
+    $cfg['partner_access'] = array_values(array_unique(array_intersect($allowed_partner_access, array_map('strval', $cfg['partner_access']))));
+    if (count($cfg['partner_access']) == 0) {
+        $cfg['partner_access'] = $current['partner_access'];
+    }
+
+    cvpap_save_cfg('cvpap_platform_config_json', json_encode($cfg));
+    return $cfg;
+}
+
+function cvpap_actor_role($q, $default = 'superadmin')
+{
+    $role = strtolower(trim((string) cvpap_param($q, 'actor_role', $default)));
+    return in_array($role, ['superadmin', 'partner']) ? $role : $default;
+}
+
+function cvpap_assert_superadmin_actor($q)
+{
+    if (cvpap_actor_role($q, 'superadmin') != 'superadmin') {
+        throw new CvpapApiError('This action is restricted to CVPAP superadmin');
+    }
+}
+
+function cvpap_sql($sql)
+{
+        try {
+                ORM::get_db()->exec($sql);
+        } catch (Throwable $e) {
+                _log('CVPAP schema error: ' . $e->getMessage(), 'CVPAP');
+        }
+}
+
+function cvpap_ensure_schema()
+{
+        static $done = false;
+        if ($done) {
+                return;
+        }
+        $done = true;
+
+        cvpap_sql("CREATE TABLE IF NOT EXISTS `tbl_cvpap_partners` (
+            `id` int UNSIGNED NOT NULL AUTO_INCREMENT,
+            `partner_uid` varchar(80) NOT NULL,
+            `partner_code` varchar(100) DEFAULT NULL,
+            `parent_partner_uid` varchar(80) DEFAULT NULL,
+            `admin_user_id` int UNSIGNED DEFAULT NULL,
+            `username` varchar(64) NOT NULL DEFAULT '',
+            `fullname` varchar(128) NOT NULL DEFAULT '',
+            `email` varchar(128) NOT NULL DEFAULT '',
+            `phone` varchar(32) NOT NULL DEFAULT '',
+            `status` enum('Active','Inactive') NOT NULL DEFAULT 'Active',
+            `settings_json` mediumtext,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uniq_partner_uid` (`partner_uid`),
+            KEY `idx_partner_admin_user` (`admin_user_id`),
+            KEY `idx_partner_parent` (`parent_partner_uid`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci");
+
+        cvpap_sql("CREATE TABLE IF NOT EXISTS `tbl_cvpap_partner_routers` (
+            `id` int UNSIGNED NOT NULL AUTO_INCREMENT,
+            `partner_uid` varchar(80) NOT NULL,
+            `router_id` int NOT NULL,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uniq_partner_router` (`partner_uid`,`router_id`),
+            UNIQUE KEY `uniq_router_owner` (`router_id`),
+            KEY `idx_partner_router_partner` (`partner_uid`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci");
+
+        cvpap_sql("CREATE TABLE IF NOT EXISTS `tbl_cvpap_partner_customers` (
+            `id` int UNSIGNED NOT NULL AUTO_INCREMENT,
+            `partner_uid` varchar(80) NOT NULL,
+            `customer_id` int NOT NULL,
+            `external_customer_id` varchar(80) DEFAULT NULL,
+            `external_phone` varchar(32) DEFAULT NULL,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uniq_partner_customer` (`partner_uid`,`customer_id`),
+            KEY `idx_partner_external_customer` (`partner_uid`,`external_customer_id`),
+            KEY `idx_partner_external_phone` (`partner_uid`,`external_phone`),
+            KEY `idx_partner_customer_customer` (`customer_id`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci");
+
+        cvpap_sql("CREATE TABLE IF NOT EXISTS `tbl_cvpap_partner_webhooks` (
+            `id` int UNSIGNED NOT NULL AUTO_INCREMENT,
+            `partner_uid` varchar(80) NOT NULL,
+            `owner_type` enum('partner','customer') NOT NULL DEFAULT 'partner',
+            `customer_id` int NOT NULL DEFAULT '0',
+            `event_name` varchar(64) NOT NULL DEFAULT '*',
+            `url` varchar(512) NOT NULL,
+            `secret` varchar(128) NOT NULL,
+            `headers_json` mediumtext,
+            `enabled` tinyint(1) NOT NULL DEFAULT '1',
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            KEY `idx_partner_webhooks_partner` (`partner_uid`,`owner_type`,`customer_id`,`enabled`),
+            KEY `idx_partner_webhooks_event` (`event_name`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci");
+
+        cvpap_sql("CREATE TABLE IF NOT EXISTS `tbl_cvpap_sso_tokens` (
+            `id` int UNSIGNED NOT NULL AUTO_INCREMENT,
+            `token_hash` char(64) NOT NULL,
+            `partner_uid` varchar(80) NOT NULL,
+            `admin_user_id` int UNSIGNED NOT NULL,
+            `redirect_to` varchar(255) NOT NULL DEFAULT 'dashboard',
+            `expires_at` datetime NOT NULL,
+            `used_at` datetime DEFAULT NULL,
+            `request_ip` varchar(64) DEFAULT NULL,
+            `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uniq_sso_token_hash` (`token_hash`),
+            KEY `idx_sso_partner_expires` (`partner_uid`,`expires_at`),
+            KEY `idx_sso_admin` (`admin_user_id`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci");
+}
+
 /* ------------------------------------------------------------- requests */
 
 function cvpap_raw_body()
@@ -82,6 +256,163 @@ function cvpap_require_params($q, $keys)
     }
 }
 
+function cvpap_partner_uid($q, $required = false)
+{
+    $partner_uid = trim((string) cvpap_param($q, 'partner_id', ''));
+    if ($required && $partner_uid == '') {
+        throw new CvpapApiError('Missing required parameter: partner_id');
+    }
+    return $partner_uid;
+}
+
+function cvpap_partner_find($partner_uid)
+{
+    cvpap_ensure_schema();
+    $partner_uid = trim((string) $partner_uid);
+    if ($partner_uid == '') {
+        return null;
+    }
+    return ORM::for_table('tbl_cvpap_partners')->where('partner_uid', $partner_uid)->find_one();
+}
+
+function cvpap_partner_upsert_row($q, $admin_user_id = 0)
+{
+    cvpap_ensure_schema();
+    $partner_uid = cvpap_partner_uid($q, true);
+    $row = cvpap_partner_find($partner_uid);
+    if (!$row) {
+        $row = ORM::for_table('tbl_cvpap_partners')->create();
+        $row->partner_uid = $partner_uid;
+    }
+    if (!empty($q['partner_code']) || !empty($q['partnerId'])) {
+        $row->partner_code = !empty($q['partner_code']) ? $q['partner_code'] : $q['partnerId'];
+    }
+    if (array_key_exists('parent_partner_id', $q)) {
+        $row->parent_partner_uid = trim((string) $q['parent_partner_id']);
+    }
+    if (!empty($q['username'])) {
+        $row->username = trim((string) $q['username']);
+    }
+    if (!empty($q['fullname'])) {
+        $row->fullname = trim((string) $q['fullname']);
+    }
+    if (!empty($q['email'])) {
+        $row->email = trim((string) $q['email']);
+    }
+    if (!empty($q['phone'])) {
+        $row->phone = trim((string) $q['phone']);
+    }
+    if (!empty($q['status']) && in_array($q['status'], ['Active', 'Inactive'])) {
+        $row->status = $q['status'];
+    }
+    if (array_key_exists('admin_user_id', $q)) {
+        $admin_user_id = (int) $q['admin_user_id'];
+    }
+    if (!empty($admin_user_id)) {
+        $row->admin_user_id = (int) $admin_user_id;
+    } else if (array_key_exists('admin_user_id', $q)) {
+        $row->admin_user_id = null;
+    }
+    if (array_key_exists('settings', $q)) {
+        $settings = $q['settings'];
+        if (is_array($settings)) {
+            $row->settings_json = json_encode($settings);
+        } else if (is_string($settings)) {
+            $row->settings_json = $settings;
+        }
+    }
+    $row->save();
+    return $row;
+}
+
+function cvpap_partner_router_link($partner_uid, $router_id)
+{
+    cvpap_ensure_schema();
+    $partner_uid = trim((string) $partner_uid);
+    $router_id = (int) $router_id;
+    if ($partner_uid == '' || $router_id <= 0) {
+        return;
+    }
+
+    ORM::for_table('tbl_cvpap_partner_routers')->where('router_id', $router_id)->delete_many();
+
+    $link = ORM::for_table('tbl_cvpap_partner_routers')->create();
+    $link->partner_uid = $partner_uid;
+    $link->router_id = $router_id;
+    $link->save();
+}
+
+function cvpap_partner_router_unlink($router_id)
+{
+    cvpap_ensure_schema();
+    ORM::for_table('tbl_cvpap_partner_routers')->where('router_id', (int) $router_id)->delete_many();
+}
+
+function cvpap_partner_router_names($partner_uid)
+{
+    cvpap_ensure_schema();
+    $partner_uid = trim((string) $partner_uid);
+    if ($partner_uid == '') {
+        return [];
+    }
+    $links = ORM::for_table('tbl_cvpap_partner_routers')
+        ->where('partner_uid', $partner_uid)
+        ->find_many();
+    if (count($links) == 0) {
+        return [];
+    }
+    $router_ids = [];
+    foreach ($links as $link) {
+        $router_ids[] = (int) $link['router_id'];
+    }
+    if (count($router_ids) == 0) {
+        return [];
+    }
+    $routers = ORM::for_table('tbl_routers')->where_in('id', $router_ids)->find_many();
+    $names = [];
+    foreach ($routers as $router) {
+        $names[] = $router['name'];
+    }
+    return array_values(array_unique($names));
+}
+
+function cvpap_partner_customer_link($partner_uid, $customer_id, $external_customer_id = '', $external_phone = '')
+{
+    cvpap_ensure_schema();
+    $partner_uid = trim((string) $partner_uid);
+    $customer_id = (int) $customer_id;
+    if ($partner_uid == '' || $customer_id <= 0) {
+        return null;
+    }
+    $row = ORM::for_table('tbl_cvpap_partner_customers')
+        ->where('partner_uid', $partner_uid)
+        ->where('customer_id', $customer_id)
+        ->find_one();
+    if (!$row) {
+        $row = ORM::for_table('tbl_cvpap_partner_customers')->create();
+        $row->partner_uid = $partner_uid;
+        $row->customer_id = $customer_id;
+    }
+    if ($external_customer_id !== null && $external_customer_id !== '') {
+        $row->external_customer_id = trim((string) $external_customer_id);
+    }
+    if ($external_phone !== null && $external_phone !== '') {
+        $row->external_phone = cvpap_identity_digits($external_phone);
+    }
+    $row->save();
+    return $row;
+}
+
+function cvpap_partner_uid_for_customer($customer_id)
+{
+    cvpap_ensure_schema();
+    $row = ORM::for_table('tbl_cvpap_partner_customers')
+        ->where('customer_id', (int) $customer_id)
+        ->order_by_desc('id')
+        ->find_one();
+    return $row ? $row['partner_uid'] : '';
+}
+
 /**
  * Router-name scope list sent by CVPAP (it owns the partner→router mapping).
  */
@@ -93,6 +424,12 @@ function cvpap_routers_scope($q, $required = true)
     }
     if (!is_array($routers)) {
         $routers = [];
+    }
+    if (count($routers) == 0) {
+        $partner_uid = cvpap_partner_uid($q, false);
+        if ($partner_uid != '') {
+            $routers = cvpap_partner_router_names($partner_uid);
+        }
     }
     if ($required && count($routers) == 0) {
         throw new CvpapApiError('Missing required parameter: routers (router-name scope list)');
@@ -197,6 +534,58 @@ function cvpap_identity_digits($value)
     return preg_replace('/\D+/', '', (string) $value);
 }
 
+function cvpap_issue_sso_token($partner_uid, $redirect_to = 'dashboard', $ttl_seconds = 120)
+{
+    cvpap_ensure_schema();
+    $partner = cvpap_partner_find($partner_uid);
+    if (!$partner || empty($partner['admin_user_id'])) {
+        throw new CvpapApiError('Partner is not linked to a nuxbill admin user');
+    }
+    $ttl_seconds = max(30, min((int) $ttl_seconds, 600));
+    $token_plain = bin2hex(random_bytes(24));
+
+    $row = ORM::for_table('tbl_cvpap_sso_tokens')->create();
+    $row->token_hash = hash('sha256', $token_plain);
+    $row->partner_uid = $partner_uid;
+    $row->admin_user_id = (int) $partner['admin_user_id'];
+    $row->redirect_to = trim((string) $redirect_to) == '' ? 'dashboard' : $redirect_to;
+    $row->expires_at = date('Y-m-d H:i:s', time() + $ttl_seconds);
+    $row->request_ip = isset($_SERVER['REMOTE_ADDR']) ? $_SERVER['REMOTE_ADDR'] : '';
+    $row->save();
+
+    return [
+        'token' => $token_plain,
+        'expires_at' => $row->expires_at,
+        'login_url' => APP_URL . '/?_route=admin/cvpap_sso&token=' . urlencode($token_plain),
+        'admin_user_id' => (int) $partner['admin_user_id'],
+    ];
+}
+
+function cvpap_consume_sso_token($token_plain)
+{
+    cvpap_ensure_schema();
+    $token_plain = trim((string) $token_plain);
+    if ($token_plain == '') {
+        return null;
+    }
+    $hash = hash('sha256', $token_plain);
+    $row = ORM::for_table('tbl_cvpap_sso_tokens')
+        ->where('token_hash', $hash)
+        ->where_null('used_at')
+        ->where_gte('expires_at', date('Y-m-d H:i:s'))
+        ->find_one();
+    if (!$row) {
+        return null;
+    }
+    $row->used_at = date('Y-m-d H:i:s');
+    $row->save();
+    return [
+        'admin_user_id' => (int) $row['admin_user_id'],
+        'partner_uid' => $row['partner_uid'],
+        'redirect_to' => $row['redirect_to'],
+    ];
+}
+
 /* ------------------------------------------------- password links & email */
 
 /**
@@ -261,14 +650,9 @@ function cvpap_welcome_html($brand, $fullname, $username, $portal_url, $reset_li
 
 /* ------------------------------------------------------------- webhooks */
 
-/**
- * Fire-and-forget signed webhook to CVPAP.
- */
-function cvpap_emit($event, $payload)
+function cvpap_webhook_post($url, $secret, $event, $payload)
 {
-    $url = cvpap_cfg('cvpap_webhook_url');
-    $secret = cvpap_cfg('cvpap_shared_secret');
-    if (empty($url) || empty($secret)) {
+    if (trim((string) $url) == '' || trim((string) $secret) == '') {
         return;
     }
     $body = json_encode(['event' => $event, 'sent_at' => date('c'), 'data' => $payload]);
@@ -291,8 +675,65 @@ function cvpap_emit($event, $payload)
         curl_exec($ch);
         curl_close($ch);
     } catch (Throwable $e) {
-        // never break nuxbill flows because CVPAP is unreachable
     }
+}
+
+function cvpap_partner_webhooks($partner_uid, $event, $customer_id = 0)
+{
+    cvpap_ensure_schema();
+    $partner_uid = trim((string) $partner_uid);
+    if ($partner_uid == '') {
+        return [];
+    }
+    $query = ORM::for_table('tbl_cvpap_partner_webhooks')
+        ->where('partner_uid', $partner_uid)
+        ->where('enabled', 1)
+        ->where_any_is([
+            ['event_name' => '*'],
+            ['event_name' => $event],
+        ]);
+    if ((int) $customer_id > 0) {
+        $query->where_any_is([
+            ['owner_type' => 'partner'],
+            ['owner_type' => 'customer', 'customer_id' => (int) $customer_id],
+        ]);
+    } else {
+        $query->where('owner_type', 'partner');
+    }
+    return $query->find_many();
+}
+
+function cvpap_emit_partner_webhooks($event, $payload)
+{
+    if ($event == 'recharges_expired' && isset($payload['recharges']) && is_array($payload['recharges'])) {
+        foreach ($payload['recharges'] as $recharge) {
+            if (!is_array($recharge)) {
+                continue;
+            }
+            cvpap_emit_partner_webhooks('recharge_expired', $recharge);
+        }
+        return;
+    }
+    $partner_uid = !empty($payload['partner_id']) ? $payload['partner_id'] : '';
+    $customer_id = !empty($payload['customer_id']) ? (int) $payload['customer_id'] : 0;
+    if ($partner_uid == '' && $customer_id > 0) {
+        $partner_uid = cvpap_partner_uid_for_customer($customer_id);
+    }
+    if ($partner_uid == '') {
+        return;
+    }
+    foreach (cvpap_partner_webhooks($partner_uid, $event, $customer_id) as $hook) {
+        cvpap_webhook_post($hook['url'], $hook['secret'], $event, $payload);
+    }
+}
+
+/**
+ * Fire-and-forget signed webhook to CVPAP.
+ */
+function cvpap_emit($event, $payload)
+{
+    cvpap_webhook_post(cvpap_cfg('cvpap_webhook_url'), cvpap_cfg('cvpap_shared_secret'), $event, $payload);
+    cvpap_emit_partner_webhooks($event, $payload);
 }
 
 /* ------------------------------------------------------------ event hooks */
@@ -305,7 +746,14 @@ function cvpap_on_recharge_finish()
 {
     global $c, $p, $t, $b, $d;
     $rec = (isset($d) && $d) ? $d : ((isset($b) && $b) ? $b : null);
+    $customer_id = 0;
+    if ($rec && !empty($rec['customer_id'])) {
+        $customer_id = (int) $rec['customer_id'];
+    } else if (isset($c['id'])) {
+        $customer_id = (int) $c['id'];
+    }
     $payload = [
+        'customer_id' => $customer_id,
         'username' => isset($c['username']) ? $c['username'] : '',
         'fullname' => isset($c['fullname']) ? $c['fullname'] : '',
         'plan_id' => isset($p['id']) ? $p['id'] : '',
@@ -328,8 +776,19 @@ function cvpap_on_recharge_finish()
  */
 function cvpap_on_voucher_activate()
 {
+    $code = alphanumeric(_post('code'), "-_.,");
+    $voucher = ORM::for_table('tbl_voucher')->where('code', $code)->find_one();
+    $customer_id = 0;
+    if ($voucher && !empty($voucher['user'])) {
+        $customer = ORM::for_table('tbl_customers')->where('username', $voucher['user'])->find_one();
+        if ($customer) {
+            $customer_id = (int) $customer['id'];
+        }
+    }
     cvpap_emit('voucher_activated', [
-        'code' => alphanumeric(_post('code'), "-_.,"),
+        'code' => $code,
+        'customer_id' => $customer_id,
+        'partner_id' => $voucher ? cvpap_meta_get('tbl_voucher', $voucher['id']) : '',
     ]);
 }
 
@@ -351,6 +810,10 @@ function cvpap_on_cron_end()
     }
     $expired = [];
     foreach ($rows as $r) {
+        $partner_id = cvpap_meta_get('tbl_plans', $r['plan_id']);
+        if ($partner_id == '' && !empty($r['customer_id'])) {
+            $partner_id = cvpap_partner_uid_for_customer((int) $r['customer_id']);
+        }
         $expired[] = [
             'recharge_id' => $r['id'],
             'customer_id' => $r['customer_id'],
@@ -359,6 +822,7 @@ function cvpap_on_cron_end()
             'plan_name' => $r['namebp'],
             'router' => $r['routers'],
             'expiration' => $r['expiration'] . ' ' . $r['time'],
+            'partner_id' => $partner_id,
         ];
     }
     cvpap_emit('recharges_expired', ['recharges' => $expired]);

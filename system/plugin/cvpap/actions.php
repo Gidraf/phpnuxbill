@@ -38,7 +38,18 @@ function cvpap_act_router_list($q)
     if (count($scope) > 0) {
         $query->where_in('name', $scope);
     }
-    return ['routers' => cvpap_rows($query->find_many(), ['password'])];
+    $routers = cvpap_rows($query->find_many(), ['password']);
+    foreach ($routers as &$router) {
+        $owner = cvpap_meta_get('tbl_routers', $router['id']);
+        if ($owner == '') {
+            $link = ORM::for_table('tbl_cvpap_partner_routers')->where('router_id', $router['id'])->find_one();
+            if ($link) {
+                $owner = $link['partner_uid'];
+            }
+        }
+        $router['partner_id'] = $owner;
+    }
+    return ['routers' => $routers];
 }
 
 function cvpap_act_router_get($q)
@@ -47,6 +58,12 @@ function cvpap_act_router_get($q)
     $router = $r->as_array();
     unset($router['password']);
     $router['partner_id'] = cvpap_meta_get('tbl_routers', $r['id']);
+    if ($router['partner_id'] == '') {
+        $link = ORM::for_table('tbl_cvpap_partner_routers')->where('router_id', $r['id'])->find_one();
+        if ($link) {
+            $router['partner_id'] = $link['partner_uid'];
+        }
+    }
     return ['router' => $router];
 }
 
@@ -68,6 +85,10 @@ function cvpap_act_router_create($q)
     $r->enabled = (int) cvpap_param($q, 'enabled', 1);
     $r->save();
     cvpap_meta_tag('tbl_routers', $r->id(), $q);
+    $partner_uid = cvpap_partner_uid($q, false);
+    if ($partner_uid != '') {
+        cvpap_partner_router_link($partner_uid, $r->id());
+    }
     return ['id' => $r->id(), 'name' => $r['name']];
 }
 
@@ -81,6 +102,14 @@ function cvpap_act_router_update($q)
     }
     $r->save();
     cvpap_meta_tag('tbl_routers', $r['id'], $q);
+    if (array_key_exists('partner_id', $q)) {
+        $partner_uid = trim((string) $q['partner_id']);
+        if ($partner_uid == '') {
+            cvpap_partner_router_unlink($r['id']);
+        } else {
+            cvpap_partner_router_link($partner_uid, $r['id']);
+        }
+    }
     return ['id' => $r['id'], 'name' => $r['name']];
 }
 
@@ -88,6 +117,7 @@ function cvpap_act_router_delete($q)
 {
     $r = cvpap_router_find($q);
     $id = $r['id'];
+    cvpap_partner_router_unlink($id);
     $r->delete();
     return ['deleted' => $id];
 }
@@ -373,13 +403,31 @@ function cvpap_act_plan_sync($q)
 function cvpap_act_customer_list($q)
 {
     $query = ORM::for_table('tbl_customers')->order_by_desc('id');
+    $partner_uid = cvpap_partner_uid($q, false);
+    if ($partner_uid != '') {
+        $links = ORM::for_table('tbl_cvpap_partner_customers')
+            ->where('partner_uid', $partner_uid)
+            ->find_many();
+        $ids = [];
+        foreach ($links as $link) {
+            $ids[] = (int) $link['customer_id'];
+        }
+        if (count($ids) == 0) {
+            return ['customers' => []];
+        }
+        $query->where_in('id', array_values(array_unique($ids)));
+    }
     $search = cvpap_param($q, 'search');
     if ($search) {
         $query->where_raw("(username LIKE ? OR phonenumber LIKE ? OR fullname LIKE ?)", ["%$search%", "%$search%", "%$search%"]);
     }
     $query->limit(min((int) cvpap_param($q, 'limit', 100), 500));
     $query->offset((int) cvpap_param($q, 'offset', 0));
-    return ['customers' => cvpap_rows($query->find_many(), ['password', 'pppoe_password'])];
+    $customers = cvpap_rows($query->find_many(), ['password', 'pppoe_password']);
+    foreach ($customers as &$customer) {
+        $customer['partner_id'] = cvpap_partner_uid_for_customer($customer['id']);
+    }
+    return ['customers' => $customers];
 }
 
 function cvpap_act_customer_get($q)
@@ -387,6 +435,7 @@ function cvpap_act_customer_get($q)
     $c = cvpap_customer_find($q);
     $customer = $c->as_array();
     unset($customer['password'], $customer['pppoe_password']);
+    $customer['partner_id'] = cvpap_partner_uid_for_customer($c['id']);
     return ['customer' => $customer];
 }
 
@@ -397,6 +446,8 @@ function cvpap_act_customer_get($q)
 function cvpap_act_customer_create($q)
 {
     cvpap_require_params($q, ['username']);
+    $partner_uid = cvpap_partner_uid($q, false);
+    $external_customer_id = cvpap_param($q, 'external_customer_id', cvpap_param($q, 'whatsapp_user_id', ''));
 
     $username_raw = trim((string) $q['username']);
     $username = $username_raw;
@@ -456,7 +507,16 @@ function cvpap_act_customer_create($q)
             $c->save();
         }
         cvpap_meta_tag('tbl_customers', $c['id'], $q);
-        return ['id' => $c['id'], 'username' => $c['username'], 'password' => $c['password'], 'created' => false];
+        if ($partner_uid != '') {
+            cvpap_partner_customer_link($partner_uid, $c['id'], $external_customer_id, $phone);
+        }
+        return [
+            'id' => $c['id'],
+            'username' => $c['username'],
+            'password' => $c['password'],
+            'created' => false,
+            'partner_id' => $partner_uid,
+        ];
     }
 
     $password = cvpap_param($q, 'password', (string) rand(100000, 999999));
@@ -472,18 +532,32 @@ function cvpap_act_customer_create($q)
     $c->created_by = 0;
     $c->save();
     cvpap_meta_tag('tbl_customers', $c->id(), $q);
-    return ['id' => $c->id(), 'username' => $c['username'], 'password' => $password, 'created' => true];
+    if ($partner_uid != '') {
+        cvpap_partner_customer_link($partner_uid, $c->id(), $external_customer_id, $phone);
+    }
+    return [
+        'id' => $c->id(),
+        'username' => $c['username'],
+        'password' => $password,
+        'created' => true,
+        'partner_id' => $partner_uid,
+    ];
 }
 
 function cvpap_act_customer_update($q)
 {
     $c = cvpap_customer_find($q);
+    $partner_uid = cvpap_partner_uid($q, false);
+    $external_customer_id = cvpap_param($q, 'external_customer_id', cvpap_param($q, 'whatsapp_user_id', ''));
     foreach (['fullname', 'phonenumber', 'email', 'address', 'password', 'status'] as $field) {
         if (isset($q[$field]) && $q[$field] !== '') {
             $c->$field = $q[$field];
         }
     }
     $c->save();
+    if ($partner_uid != '') {
+        cvpap_partner_customer_link($partner_uid, $c['id'], $external_customer_id, cvpap_param($q, 'phonenumber', ''));
+    }
     return ['id' => $c['id'], 'username' => $c['username']];
 }
 
@@ -494,6 +568,10 @@ function cvpap_act_customer_update($q)
  */
 function cvpap_act_password_link($q)
 {
+    $platform = cvpap_platform_config();
+    if ($platform['communications_owner'] == 'cvpap') {
+        throw new CvpapApiError('Password-link communication is delegated to CVPAP superadmin integrations');
+    }
     cvpap_require_params($q, ['username']);
     $c = ORM::for_table('tbl_customers')->where('username', $q['username'])->find_one();
     if (!$c) {
@@ -508,6 +586,10 @@ function cvpap_act_password_link($q)
  */
 function cvpap_act_send_welcome($q)
 {
+    $platform = cvpap_platform_config();
+    if ($platform['communications_owner'] == 'cvpap') {
+        throw new CvpapApiError('Welcome-email delivery is delegated to CVPAP superadmin integrations');
+    }
     global $config;
     cvpap_require_params($q, ['username']);
     $c = ORM::for_table('tbl_customers')->where('username', $q['username'])->find_one();
@@ -537,64 +619,297 @@ function cvpap_act_send_welcome($q)
 /* ---------------------------------------------------------------- partners */
 
 /**
- * Upsert a CVPAP partner as a nuxbill Agent (tbl_users) so partners share
- * one login across both systems. Password is optional — when CVPAP has the
- * plaintext (set/reset moments) it passes it along and we store sha1 like
- * nuxbill does natively.
+ * Upsert a CVPAP partner record in tbl_cvpap_partners.
+ *
+ * This does NOT create/update tbl_users anymore.
+ * If a local nuxbill admin/agent already exists, CVPAP may pass
+ * `admin_user_id` to link that existing user for SSO.
  */
 function cvpap_act_partner_upsert($q)
 {
-    cvpap_require_params($q, ['username']);
+    $partner_id = cvpap_partner_uid($q, true);
+    $existing = cvpap_partner_find($partner_id);
+    $created = !$existing;
 
-    $username = trim((string) $q['username']);
-    if ($username == '') {
-        throw new CvpapApiError('Invalid username');
-    }
-
-    $u = null;
-    $partner_id = cvpap_param($q, 'partner_id');
-    if (!empty($partner_id)) {
-        $user_id = cvpap_meta_find_tbl_id('tbl_users', $partner_id);
-        if (!empty($user_id)) {
-            $u = ORM::for_table('tbl_users')->find_one($user_id);
-        }
-    }
-    if (!$u) {
-        $u = ORM::for_table('tbl_users')->where('username', $username)->find_one();
-    }
-
-    $created = false;
-    if (!$u) {
-        $u = ORM::for_table('tbl_users')->create();
-        $u->username = $username;
-        $u->user_type = cvpap_param($q, 'user_type', 'Agent');
-        $u->status = 'Active';
-        $u->creationdate = date('Y-m-d H:i:s');
-        // unusable random password until CVPAP pushes the real one
-        $u->password = Password::_crypt(bin2hex(random_bytes(16)));
-        $created = true;
-    } else if ($u['username'] != $username) {
-        $dup = ORM::for_table('tbl_users')->where('username', $username)->find_one();
-        if (!$dup || $dup['id'] == $u['id']) {
-            $u->username = $username;
+    $admin_user_id = 0;
+    if (array_key_exists('admin_user_id', $q) && $q['admin_user_id'] !== '' && $q['admin_user_id'] !== null) {
+        $admin_user_id = (int) $q['admin_user_id'];
+        if ($admin_user_id > 0) {
+            $admin_user = ORM::for_table('tbl_users')->find_one($admin_user_id);
+            if (!$admin_user) {
+                throw new CvpapApiError('admin_user_id not found in tbl_users');
+            }
         }
     }
 
-    foreach (['fullname', 'email', 'phone'] as $field) {
-        if (!empty($q[$field])) {
-            $u->$field = $q[$field];
+    $partner_row = cvpap_partner_upsert_row($q, $admin_user_id);
+    return [
+        'id' => $partner_row ? (int) $partner_row['id'] : 0,
+        'username' => $partner_row ? $partner_row['username'] : '',
+        'created' => $created,
+        'partner' => $partner_row ? $partner_row->as_array() : null,
+    ];
+}
+
+function cvpap_act_partner_get($q)
+{
+    $partner_uid = cvpap_partner_uid($q, true);
+    $partner = cvpap_partner_find($partner_uid);
+    if (!$partner) {
+        throw new CvpapApiError('Partner not found');
+    }
+    $data = $partner->as_array();
+    $data['router_names'] = cvpap_partner_router_names($partner_uid);
+    $data['customer_count'] = ORM::for_table('tbl_cvpap_partner_customers')
+        ->where('partner_uid', $partner_uid)->count();
+    if (!empty($data['settings_json'])) {
+        $decoded = json_decode($data['settings_json'], true);
+        $data['settings'] = is_array($decoded) ? $decoded : [];
+    } else {
+        $data['settings'] = [];
+    }
+    return ['partner' => $data];
+}
+
+function cvpap_act_partner_settings($q)
+{
+    $partner_uid = cvpap_partner_uid($q, true);
+    $partner = cvpap_partner_find($partner_uid);
+    if (!$partner) {
+        throw new CvpapApiError('Partner not found');
+    }
+    if (array_key_exists('settings', $q)) {
+        $partner = cvpap_partner_upsert_row($q, (int) $partner['admin_user_id']);
+    }
+    $settings = [];
+    if (!empty($partner['settings_json'])) {
+        $decoded = json_decode($partner['settings_json'], true);
+        $settings = is_array($decoded) ? $decoded : [];
+    }
+    return ['partner_id' => $partner_uid, 'settings' => $settings];
+}
+
+function cvpap_act_partner_router_scope($q)
+{
+    $partner_uid = cvpap_partner_uid($q, true);
+    return ['partner_id' => $partner_uid, 'routers' => cvpap_partner_router_names($partner_uid)];
+}
+
+function cvpap_act_partner_customer_link($q)
+{
+    $partner_uid = cvpap_partner_uid($q, true);
+    $customer_id = (int) cvpap_param($q, 'customer_id', 0);
+    if ($customer_id <= 0) {
+        $username = cvpap_param($q, 'username', '');
+        if ($username == '') {
+            throw new CvpapApiError('Provide customer_id or username');
+        }
+        $customer = ORM::for_table('tbl_customers')->where('username', $username)->find_one();
+        if (!$customer) {
+            throw new CvpapApiError('Customer not found');
+        }
+        $customer_id = (int) $customer['id'];
+    }
+    $link = cvpap_partner_customer_link(
+        $partner_uid,
+        $customer_id,
+        cvpap_param($q, 'external_customer_id', cvpap_param($q, 'whatsapp_user_id', '')),
+        cvpap_param($q, 'external_phone', cvpap_param($q, 'phone', ''))
+    );
+    return ['link' => $link ? $link->as_array() : null];
+}
+
+function cvpap_act_partner_customer_links($q)
+{
+    $partner_uid = cvpap_partner_uid($q, true);
+    $query = ORM::for_table('tbl_cvpap_partner_customers')->where('partner_uid', $partner_uid);
+    $query->order_by_desc('id');
+    $query->limit(min((int) cvpap_param($q, 'limit', 200), 1000));
+    $query->offset((int) cvpap_param($q, 'offset', 0));
+    return ['links' => cvpap_rows($query->find_many())];
+}
+
+function cvpap_act_partner_webhook_upsert($q)
+{
+    cvpap_ensure_schema();
+    $partner_uid = cvpap_partner_uid($q, true);
+    cvpap_require_params($q, ['url', 'secret']);
+    $id = (int) cvpap_param($q, 'id', 0);
+    $owner_type = cvpap_param($q, 'owner_type', 'partner');
+    if (!in_array($owner_type, ['partner', 'customer'])) {
+        throw new CvpapApiError('owner_type must be partner or customer');
+    }
+    $row = null;
+    if ($id > 0) {
+        $row = ORM::for_table('tbl_cvpap_partner_webhooks')
+            ->where('id', $id)
+            ->where('partner_uid', $partner_uid)
+            ->find_one();
+    }
+    if (!$row) {
+        $row = ORM::for_table('tbl_cvpap_partner_webhooks')->create();
+        $row->partner_uid = $partner_uid;
+    }
+    $row->owner_type = $owner_type;
+    $row->customer_id = (int) cvpap_param($q, 'customer_id', 0);
+    $row->event_name = trim((string) cvpap_param($q, 'event_name', '*'));
+    $row->url = trim((string) $q['url']);
+    $row->secret = trim((string) $q['secret']);
+    $headers = cvpap_param($q, 'headers', null);
+    if (is_array($headers)) {
+        $row->headers_json = json_encode($headers);
+    } else if (is_string($headers) && $headers !== '') {
+        $row->headers_json = $headers;
+    }
+    if (isset($q['enabled'])) {
+        $row->enabled = (int) !!$q['enabled'];
+    }
+    $row->save();
+    return ['webhook' => $row->as_array()];
+}
+
+function cvpap_act_partner_webhook_list($q)
+{
+    cvpap_ensure_schema();
+    $partner_uid = cvpap_partner_uid($q, true);
+    $query = ORM::for_table('tbl_cvpap_partner_webhooks')->where('partner_uid', $partner_uid);
+    if (!empty($q['owner_type'])) {
+        $query->where('owner_type', $q['owner_type']);
+    }
+    if (isset($q['customer_id']) && $q['customer_id'] !== '') {
+        $query->where('customer_id', (int) $q['customer_id']);
+    }
+    if (isset($q['enabled']) && $q['enabled'] !== '') {
+        $query->where('enabled', (int) !!$q['enabled']);
+    }
+    $query->order_by_desc('id');
+    return ['webhooks' => cvpap_rows($query->find_many())];
+}
+
+function cvpap_act_partner_webhook_delete($q)
+{
+    cvpap_ensure_schema();
+    $partner_uid = cvpap_partner_uid($q, true);
+    $id = (int) cvpap_param($q, 'id', 0);
+    if ($id <= 0) {
+        throw new CvpapApiError('Missing required parameter: id');
+    }
+    $row = ORM::for_table('tbl_cvpap_partner_webhooks')
+        ->where('id', $id)
+        ->where('partner_uid', $partner_uid)
+        ->find_one();
+    if (!$row) {
+        throw new CvpapApiError('Webhook not found');
+    }
+    $row->delete();
+    return ['deleted' => $id];
+}
+
+function cvpap_act_partner_sso_issue($q)
+{
+    cvpap_assert_superadmin_actor($q);
+    $platform = cvpap_platform_config();
+    if ($platform['advanced_settings_owner'] != 'superadmin') {
+        throw new CvpapApiError('SSO issuance is disabled unless advanced settings owner is superadmin');
+    }
+    $partner_uid = cvpap_partner_uid($q, true);
+    $ttl = (int) cvpap_param($q, 'ttl_seconds', 120);
+    $redirect_to = cvpap_param($q, 'redirect_to', 'dashboard');
+    return cvpap_issue_sso_token($partner_uid, $redirect_to, $ttl);
+}
+
+function cvpap_act_partner_usage($q)
+{
+    cvpap_assert_superadmin_actor($q);
+    $platform = cvpap_platform_config();
+    if ($platform['billing_owner'] != 'superadmin') {
+        throw new CvpapApiError('Partner billing usage metrics are restricted to CVPAP superadmin');
+    }
+    $partner_uid = cvpap_partner_uid($q, true);
+    $routers = cvpap_partner_router_names($partner_uid);
+    $from = cvpap_param($q, 'date_from', date('Y-m-d', strtotime('-30 days')));
+    $to = cvpap_param($q, 'date_to', date('Y-m-d'));
+
+    $customer_count = ORM::for_table('tbl_cvpap_partner_customers')
+        ->where('partner_uid', $partner_uid)
+        ->count();
+    $router_count = count($routers);
+
+    $active_recharges = 0;
+    $transactions_count = 0;
+    $transactions_total = 0.0;
+    if ($router_count > 0) {
+        $active_recharges = ORM::for_table('tbl_user_recharges')
+            ->where_in('routers', $routers)
+            ->where('status', 'on')
+            ->count();
+
+        $txs = ORM::for_table('tbl_transactions')
+            ->where_in('routers', $routers)
+            ->where_gte('recharged_on', $from)
+            ->where_lte('recharged_on', $to)
+            ->find_many();
+        $transactions_count = count($txs);
+        foreach ($txs as $tx) {
+            $transactions_total += (float) $tx['price'];
         }
     }
-    if (!empty($q['password'])) {
-        $u->password = Password::_crypt($q['password']);
+
+    return [
+        'partner_id' => $partner_uid,
+        'date_from' => $from,
+        'date_to' => $to,
+        'metrics' => [
+            'routers' => $router_count,
+            'customers' => $customer_count,
+            'active_recharges' => $active_recharges,
+            'transactions_count' => $transactions_count,
+            'transactions_total' => round($transactions_total, 2),
+        ],
+    ];
+}
+
+function cvpap_act_platform_config($q)
+{
+    cvpap_assert_superadmin_actor($q);
+    $cfg = cvpap_platform_config();
+    if (array_key_exists('set', $q) && is_array($q['set'])) {
+        $cfg = cvpap_save_platform_config($q['set']);
     }
-    if (isset($q['status']) && in_array($q['status'], ['Active', 'Inactive'])) {
-        $u->status = $q['status'];
+    return ['platform_config' => $cfg];
+}
+
+function cvpap_act_customer_logs($q)
+{
+    cvpap_require_params($q, ['customer_id']);
+    $customer_id = (int) $q['customer_id'];
+    if ($customer_id <= 0) {
+        throw new CvpapApiError('Invalid customer_id');
     }
-    $u->save();
-    cvpap_meta_tag('tbl_users', $u->id(), $q);
-    return ['id' => $u->id(), 'username' => $u['username'],
-            'user_type' => $u['user_type'], 'created' => $created];
+    $partner_uid = cvpap_partner_uid($q, false);
+    if ($partner_uid != '') {
+        $owner = cvpap_partner_uid_for_customer($customer_id);
+        if ($owner != $partner_uid) {
+            throw new CvpapApiError('Customer not in partner scope');
+        }
+    }
+
+    $rows = ORM::for_table('tbl_user_recharges')
+        ->where('customer_id', $customer_id)
+        ->order_by_desc('id')
+        ->limit(min((int) cvpap_param($q, 'limit', 200), 1000))
+        ->offset((int) cvpap_param($q, 'offset', 0))
+        ->find_many();
+
+    $logs = cvpap_rows($rows);
+    foreach ($logs as &$log) {
+        $log['partner_id'] = cvpap_partner_uid_for_customer($customer_id);
+    }
+
+    return [
+        'customer_id' => $customer_id,
+        'logs' => $logs,
+    ];
 }
 
 /* -------------------------------------------------------------- recharge */
@@ -625,6 +940,15 @@ function cvpap_act_recharge($q)
     $inv = Package::rechargeUser($c['id'], $q['router'], $p['id'], $gateway, $channel, $note);
     if (!$inv) {
         throw new CvpapApiError('Recharge failed');
+    }
+    $partner_uid = cvpap_partner_uid($q, false);
+    if ($partner_uid != '') {
+        cvpap_partner_customer_link(
+            $partner_uid,
+            $c['id'],
+            cvpap_param($q, 'external_customer_id', cvpap_param($q, 'whatsapp_user_id', '')),
+            $c['phonenumber']
+        );
     }
     return cvpap_recharge_result($c['username'], $q['router'], $p, $inv, $c['password']);
 }
@@ -927,12 +1251,20 @@ function cvpap_push_plan_to_device($p)
 
 function cvpap_recharge_result($username, $router, $p, $invoice, $password = '')
 {
+    $customer = ORM::for_table('tbl_customers')->where('username', $username)->find_one();
+    $customer_id = $customer ? (int) $customer['id'] : 0;
+    $partner_id = cvpap_meta_get('tbl_plans', $p['id']);
+    if ($partner_id == '' && $customer_id > 0) {
+        $partner_id = cvpap_partner_uid_for_customer($customer_id);
+    }
     $rec = ORM::for_table('tbl_user_recharges')
         ->where('username', $username)
         ->where('routers', $router)
         ->order_by_desc('id')
         ->find_one();
     return [
+        'customer_id' => $customer_id,
+        'partner_id' => $partner_id,
         'invoice' => $invoice,
         'username' => $username,
         'password' => $password,

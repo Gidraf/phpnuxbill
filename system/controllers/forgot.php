@@ -19,15 +19,25 @@ if (!empty($_COOKIE['forgot_username']) && in_array($step, [0, 1])) {
 }
 
 if ($step == 1) {
-    $username = _post('username');
-    if (!empty($username)) {
-        $ui->assign('username', $username);
+    $identifier = trim(_post('username'));
+    if (!empty($identifier)) {
+        $ui->assign('username', $identifier);
         if (!file_exists($otpPath)) {
             mkdir($otpPath);
         }
-        setcookie('forgot_username', $username, time() + 3600, '/');
-        $user = ORM::for_table('tbl_customers')->selects(['phonenumber', 'email'])->where('username', $username)->find_one();
+        $lookupPhone = Lang::phoneFormat($identifier);
+        $user = ORM::for_table('tbl_customers')
+            ->selects(['username', 'phonenumber', 'email'])
+            ->where_any_is([
+                ['username' => $identifier],
+                ['email' => $identifier],
+                ['phonenumber' => $identifier],
+                ['phonenumber' => $lookupPhone],
+            ])->find_one();
         if ($user) {
+            $username = $user['username'];
+            $ui->assign('username', $username);
+            setcookie('forgot_username', $username, time() + 3600, '/');
             $otpPath .= sha1($username . $db_pass) . ".txt";
             if (file_exists($otpPath) && time() - filemtime($otpPath) < 600) {
                 $sec = time() - filemtime($otpPath);
@@ -35,21 +45,24 @@ if ($step == 1) {
                 $ui->assign('notify', Lang::T("Verification Code already Sent to Your Phone/Email/Whatsapp, please wait")." $sec seconds.");
             } else {
                 $via = $config['user_notification_reminder'];
-                if ($via == 'email') {
-                    $via = 'sms';
-                }
                 $otp = mt_rand(100000, 999999);
                 file_put_contents($otpPath, $otp);
-                if ($via == 'sms') {
+                if ($via == 'sms' || $via == 'both') {
                     Message::sendSMS($user['phonenumber'], $config['CompanyName'] . " C0de: $otp");
-                } else {
+                }
+                if ($via == 'wa' || $via == 'both') {
                     Message::sendWhatsapp($user['phonenumber'], $config['CompanyName'] . " C0de: $otp");
                 }
-                Message::sendEmail(
-                    $user['email'],
-                    $config['CompanyName'] . Lang::T("Your Verification Code") . ' : ' . $otp,
-                    Lang::T("Your Verification Code") . ' : <b>' . $otp . '</b>'
-                );
+                if (!empty($user['email'])) {
+                    $emailSent = Message::sendEmail(
+                        $user['email'],
+                        $config['CompanyName'] . Lang::T("Your Verification Code") . ' : ' . $otp,
+                        Lang::T("Your Verification Code") . ' : <b>' . $otp . '</b>'
+                    );
+                    if (!$emailSent) {
+                        _log('Forgot-password email failed for username ' . $username);
+                    }
+                }
                 $ui->assign('notify_t', 's');
                 $ui->assign('notify', Lang::T("If your Username is found, Verification Code has been Sent to Your Phone/Email/Whatsapp"));
             }

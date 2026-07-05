@@ -15,8 +15,9 @@ Run ON THE SERVER (cleanup uses the local mysql client):
     NUXBILL_API_KEY='<api key>' NUXBILL_SECRET='<shared secret>' \
         python3 cvpap-e2e-test.py [--keep]
 
-  NUXBILL_URL     override the API base (default http://127.0.0.1:39090/system/api.php)
-  --keep          leave the test data in place for manual inspection in the UI
+    NUXBILL_URL                 override the API base (default http://127.0.0.1:39090/system/api.php)
+    NUXBILL_PARTNER_ADMIN_USER_ID optional existing tbl_users.id to link partner for SSO testing
+    --keep                      leave the test data in place for manual inspection in the UI
 
 Prereqs: the plugin's shared secret must be set (admin UI → Settings →
 CVPAP Bridge), and the api_key must exist (Settings → App Settings).
@@ -45,7 +46,9 @@ PLAN = f"E2E 1 Hour {STAMP}"
 BW = "CVPAP-E2E-5M"
 PHONE_BUY = "254700000001"
 PHONE_GIFT = "254700000002"
-PARTNER = "e2e-test"
+PARTNER = f"e2e-test-{STAMP}"
+PARTNER_USER = f"e2e-agent-{STAMP}"
+PARTNER_ADMIN_USER_ID = os.environ.get("NUXBILL_PARTNER_ADMIN_USER_ID", "").strip()
 
 PASS = FAIL = 0
 
@@ -115,7 +118,7 @@ def mysql(sql):
 
 def main():
     print(f"CVPAP e2e billing test — {BASE}")
-    print(f"test entities: router={ROUTER} plan='{PLAN}' phones={PHONE_BUY},{PHONE_GIFT}")
+    print(f"test entities: partner={PARTNER} router={ROUTER} plan='{PLAN}' phones={PHONE_BUY},{PHONE_GIFT}")
 
     if not API_KEY or not SECRET:
         print("\nSet NUXBILL_API_KEY and NUXBILL_SECRET first:")
@@ -136,6 +139,76 @@ def main():
         print("\nSigned calls rejected — is the shared secret set in Settings → CVPAP Bridge,")
         print("and does NUXBILL_SECRET match it exactly?")
         sys.exit(1)
+
+    # ── 1b. partner bootstrap / control-plane surfaces ────────────────────
+    section("1b. Partner surfaces")
+    partner_payload = {
+        "partner_id": PARTNER,
+        "username": PARTNER_USER,
+        "fullname": "E2E Partner",
+        "email": f"{PARTNER_USER}@example.com",
+        "phone": "254700000099",
+        "status": "Active",
+        "settings": {
+            "language": "en",
+            "timezone": "UTC",
+        },
+    }
+    if PARTNER_ADMIN_USER_ID:
+        partner_payload["admin_user_id"] = PARTNER_ADMIN_USER_ID
+
+    partner = step("partner_upsert creates tenant record", "partner_upsert", partner_payload,
+                   check=lambda r: None if r.get("partner") and r.get("partner", {}).get("partner_uid") == PARTNER
+        else "partner row missing from response")
+    if partner is None:
+        sys.exit(1)
+
+    step("partner_get returns profile", "partner_get", {
+        "partner_id": PARTNER,
+    }, check=lambda r: None if r.get("partner", {}).get("partner_uid") == PARTNER
+        else "partner lookup failed")
+
+    step("partner_settings round-trip", "partner_settings", {
+        "partner_id": PARTNER,
+        "settings": {
+            "language": "en",
+            "timezone": "UTC",
+            "theme": "e2e",
+        },
+    }, check=lambda r: None if r.get("settings", {}).get("theme") == "e2e"
+        else "settings not persisted")
+
+    if PARTNER_ADMIN_USER_ID:
+        step("partner_sso_issue returns switch URL", "partner_sso_issue", {
+            "partner_id": PARTNER,
+            "ttl_seconds": 120,
+            "redirect_to": "dashboard",
+        }, check=lambda r: None if r.get("token") and r.get("login_url")
+            else "missing token/login_url")
+    else:
+        print("  SKIP  partner_sso_issue (set NUXBILL_PARTNER_ADMIN_USER_ID to test SSO issuance)")
+
+    webhook_id = None
+    hook = step("partner_webhook_upsert stores endpoint", "partner_webhook_upsert", {
+        "partner_id": PARTNER,
+        "owner_type": "partner",
+        "event_name": "recharge_success",
+        "url": "https://example.invalid/cvpap-e2e",
+        "secret": "e2e-secret",
+        "headers": {
+            "X-E2E": "1",
+        },
+        "enabled": 1,
+    }, check=lambda r: None if r.get("webhook", {}).get("id")
+        else "webhook id missing")
+    if hook:
+        webhook_id = hook.get("webhook", {}).get("id")
+
+    step("partner_webhook_list includes endpoint", "partner_webhook_list", {
+        "partner_id": PARTNER,
+        "owner_type": "partner",
+    }, check=lambda r: None if webhook_id is None or any(w.get("id") == webhook_id for w in r.get("webhooks", []))
+        else "webhook not listed")
 
     # ── 2. provisioning objects ────────────────────────────────────────────
     section("2. Router / bandwidth / plan (Dummy device)")
@@ -172,6 +245,11 @@ def main():
         sys.exit(1)
     plan_id = plan["id"]
 
+    step("partner_router_scope returns owned router", "partner_router_scope", {
+        "partner_id": PARTNER,
+    }, check=lambda r: None if ROUTER in r.get("routers", [])
+        else "router not in partner scope")
+
     step("plan visible in scoped plan_list", "plan_list", {"routers": [ROUTER]},
          check=lambda r: None if any(p.get("id") == plan_id for p in r.get("plans", []))
          else "created plan not in list")
@@ -194,10 +272,27 @@ def main():
          check=lambda r: None if any(float(t.get("price", 0)) == 20.0 for t in r.get("transactions", []))
          else "no 20 KES transaction found")
 
+    step("partner_usage returns metrics", "partner_usage", {
+        "partner_id": PARTNER,
+    }, check=lambda r: None if r.get("metrics", {}).get("customers", 0) >= 1
+        else "usage metrics missing customers")
+
     step("repeat purchase extends same customer (idempotent path)", "portal_provision", {
         "phone": PHONE_BUY, "router": ROUTER, "plan_id": plan_id,
         "routers": [ROUTER], "channel": "E2E-TEST-RECEIPT-2", "partner_id": PARTNER,
     })
+
+    step("partner_customer_links includes buyer", "partner_customer_links", {
+        "partner_id": PARTNER,
+        "limit": 50,
+    }, check=lambda r: None if any(l.get("external_phone") == PHONE_BUY for l in r.get("links", []))
+        else "buyer link missing")
+
+    step("customer_list scoped by partner_id", "customer_list", {
+        "partner_id": PARTNER,
+        "limit": 100,
+    }, check=lambda r: None if any(c.get("username") == PHONE_BUY for c in r.get("customers", []))
+        else "scoped customer list missing buyer")
 
     # ── 4. voucher path (gifts / printed cards) ─────────────────────────────
     section("4. Vouchers")
@@ -222,6 +317,13 @@ def main():
     step("online_users responds (offline router → error entry, not crash)",
          "online_users", {"routers": [ROUTER]})
 
+    if webhook_id:
+        step("partner_webhook_delete removes endpoint", "partner_webhook_delete", {
+            "partner_id": PARTNER,
+            "id": webhook_id,
+        }, check=lambda r: None if int(r.get("deleted", 0)) == int(webhook_id)
+            else "webhook not deleted")
+
     # ── 6. cleanup ──────────────────────────────────────────────────────────
     section("6. Cleanup" + (" (skipped — --keep)" if KEEP else ""))
     if not KEEP:
@@ -229,6 +331,12 @@ def main():
             f"DELETE FROM tbl_user_recharges WHERE routers='{ROUTER}';"
             f"DELETE FROM tbl_transactions WHERE routers='{ROUTER}';"
             f"DELETE FROM tbl_voucher WHERE routers='{ROUTER}';"
+            f"DELETE FROM tbl_cvpap_partner_routers WHERE partner_uid='{PARTNER}';"
+            f"DELETE FROM tbl_cvpap_partner_customers WHERE partner_uid='{PARTNER}';"
+            f"DELETE FROM tbl_cvpap_partner_webhooks WHERE partner_uid='{PARTNER}';"
+            f"DELETE FROM tbl_cvpap_sso_tokens WHERE partner_uid='{PARTNER}';"
+            f"DELETE FROM tbl_cvpap_partners WHERE partner_uid='{PARTNER}';"
+            f"DELETE FROM tbl_users WHERE username='{PARTNER_USER}';"
             f"DELETE FROM tbl_customers WHERE username IN ('{PHONE_BUY}','{PHONE_GIFT}');"
         )
         if sql_ok:

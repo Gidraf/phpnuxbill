@@ -12,6 +12,47 @@ online users) and emits signed webhooks on recharge/voucher/expiry events.
 
 Full deployment guide lives in the CVPAP repo: `docs/WIFI_NUXBILL_DEPLOYMENT.md`.
 
+## Multitenant Extensions (CVPAP)
+
+This bridge now includes a tenant layer for CVPAP partner operations:
+
+- Partner registry in nuxbill: `tbl_cvpap_partners`.
+- Partner-owned routers: `tbl_cvpap_partner_routers`.
+- Partner-to-customer (WhatsApp user) links: `tbl_cvpap_partner_customers`.
+- Partner/customer webhook endpoints + secrets: `tbl_cvpap_partner_webhooks`.
+- One-time SSO switch tokens (CVPAP → nuxbill): `tbl_cvpap_sso_tokens`.
+
+New bridge actions include:
+
+- `partner_get`, `partner_settings`, `partner_router_scope`
+- `partner_customer_link`, `partner_customer_links`
+- `partner_webhook_upsert`, `partner_webhook_list`, `partner_webhook_delete`
+- `partner_sso_issue`, `partner_usage`
+- `platform_config`, `customer_logs`
+
+SSO consume route in nuxbill admin:
+
+- `?_route=admin/cvpap_sso&token=<one-time-token>`
+
+Notes:
+
+- Existing actions still work as before.
+- `partner_upsert` updates only `tbl_cvpap_partners`; it no longer auto-creates
+  records in `tbl_users`.
+- To enable nuxbill SSO for a partner, link an existing local user by sending
+  `admin_user_id` in `partner_upsert`.
+- Platform governance defaults are superadmin-owned: advanced settings,
+  communications and billing are delegated to CVPAP superadmin.
+- When communications owner is `cvpap`, `password_link` / `send_welcome`
+  are blocked in nuxbill and should be handled via CVPAP WhatsApp/Gmail
+  integrations.
+- `platform_config` is superadmin-only and controls governance switches.
+- `customer_logs` gives partner-scoped recharge/activity logs per customer.
+- When `partner_id` is provided, router scope can be derived server-side from
+  partner-owned routers (no need to pass explicit `routers` in every call).
+- Global CVPAP webhooks remain unchanged; partner/customer webhooks are sent in
+  addition to the global endpoint.
+
 ## Fork / upstream sync
 
 This fork keeps `master` as a clean mirror of

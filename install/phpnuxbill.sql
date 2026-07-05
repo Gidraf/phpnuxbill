@@ -270,6 +270,85 @@ CREATE TABLE IF NOT EXISTS `tbl_meta` (
   PRIMARY KEY (`id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci COMMENT='This Table to add additional data for any table';
 
+CREATE TABLE IF NOT EXISTS `tbl_cvpap_partners` (
+  `id` int UNSIGNED NOT NULL AUTO_INCREMENT,
+  `partner_uid` varchar(80) COLLATE utf8mb4_general_ci NOT NULL,
+  `partner_code` varchar(100) COLLATE utf8mb4_general_ci DEFAULT NULL,
+  `parent_partner_uid` varchar(80) COLLATE utf8mb4_general_ci DEFAULT NULL,
+  `admin_user_id` int UNSIGNED DEFAULT NULL,
+  `username` varchar(64) COLLATE utf8mb4_general_ci NOT NULL DEFAULT '',
+  `fullname` varchar(128) COLLATE utf8mb4_general_ci NOT NULL DEFAULT '',
+  `email` varchar(128) COLLATE utf8mb4_general_ci NOT NULL DEFAULT '',
+  `phone` varchar(32) COLLATE utf8mb4_general_ci NOT NULL DEFAULT '',
+  `status` enum('Active','Inactive') COLLATE utf8mb4_general_ci NOT NULL DEFAULT 'Active',
+  `settings_json` mediumtext COLLATE utf8mb4_general_ci,
+  `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uniq_partner_uid` (`partner_uid`),
+  KEY `idx_partner_admin_user` (`admin_user_id`),
+  KEY `idx_partner_parent` (`parent_partner_uid`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+CREATE TABLE IF NOT EXISTS `tbl_cvpap_partner_routers` (
+  `id` int UNSIGNED NOT NULL AUTO_INCREMENT,
+  `partner_uid` varchar(80) COLLATE utf8mb4_general_ci NOT NULL,
+  `router_id` int NOT NULL,
+  `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uniq_partner_router` (`partner_uid`,`router_id`),
+  UNIQUE KEY `uniq_router_owner` (`router_id`),
+  KEY `idx_partner_router_partner` (`partner_uid`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+CREATE TABLE IF NOT EXISTS `tbl_cvpap_partner_customers` (
+  `id` int UNSIGNED NOT NULL AUTO_INCREMENT,
+  `partner_uid` varchar(80) COLLATE utf8mb4_general_ci NOT NULL,
+  `customer_id` int NOT NULL,
+  `external_customer_id` varchar(80) COLLATE utf8mb4_general_ci DEFAULT NULL,
+  `external_phone` varchar(32) COLLATE utf8mb4_general_ci DEFAULT NULL,
+  `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uniq_partner_customer` (`partner_uid`,`customer_id`),
+  KEY `idx_partner_external_customer` (`partner_uid`,`external_customer_id`),
+  KEY `idx_partner_external_phone` (`partner_uid`,`external_phone`),
+  KEY `idx_partner_customer_customer` (`customer_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+CREATE TABLE IF NOT EXISTS `tbl_cvpap_partner_webhooks` (
+  `id` int UNSIGNED NOT NULL AUTO_INCREMENT,
+  `partner_uid` varchar(80) COLLATE utf8mb4_general_ci NOT NULL,
+  `owner_type` enum('partner','customer') COLLATE utf8mb4_general_ci NOT NULL DEFAULT 'partner',
+  `customer_id` int NOT NULL DEFAULT '0',
+  `event_name` varchar(64) COLLATE utf8mb4_general_ci NOT NULL DEFAULT '*',
+  `url` varchar(512) COLLATE utf8mb4_general_ci NOT NULL,
+  `secret` varchar(128) COLLATE utf8mb4_general_ci NOT NULL,
+  `headers_json` mediumtext COLLATE utf8mb4_general_ci,
+  `enabled` tinyint(1) NOT NULL DEFAULT '1',
+  `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  KEY `idx_partner_webhooks_partner` (`partner_uid`,`owner_type`,`customer_id`,`enabled`),
+  KEY `idx_partner_webhooks_event` (`event_name`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+CREATE TABLE IF NOT EXISTS `tbl_cvpap_sso_tokens` (
+  `id` int UNSIGNED NOT NULL AUTO_INCREMENT,
+  `token_hash` char(64) COLLATE utf8mb4_general_ci NOT NULL,
+  `partner_uid` varchar(80) COLLATE utf8mb4_general_ci NOT NULL,
+  `admin_user_id` int UNSIGNED NOT NULL,
+  `redirect_to` varchar(255) COLLATE utf8mb4_general_ci NOT NULL DEFAULT 'dashboard',
+  `expires_at` datetime NOT NULL,
+  `used_at` datetime DEFAULT NULL,
+  `request_ip` varchar(64) COLLATE utf8mb4_general_ci DEFAULT NULL,
+  `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uniq_sso_token_hash` (`token_hash`),
+  KEY `idx_sso_partner_expires` (`partner_uid`,`expires_at`),
+  KEY `idx_sso_admin` (`admin_user_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
 CREATE TABLE `tbl_odps` (
 	`id` INT NOT NULL AUTO_INCREMENT,
 	`name` VARCHAR(32) NOT NULL COLLATE 'latin1_swedish_ci',

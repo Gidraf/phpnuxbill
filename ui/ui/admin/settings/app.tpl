@@ -940,7 +940,7 @@
                                 {Lang::T('By WhatsApp')}</option>
                             <option value="sms" {if $_c['user_notification_reminder']=='sms' }selected="selected" {/if}>
                                 {Lang::T('By SMS')}</option>
-                            <option value="sms" {if $_c['user_notification_reminder']=='email' }selected="selected"
+                            <option value="email" {if $_c['user_notification_reminder']=='email' }selected="selected"
                                 {/if}>{Lang::T('By Email')}</option>
                         </select>
                     </div>

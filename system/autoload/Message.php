@@ -124,10 +124,10 @@ class Message
     {
         global $config, $PAGES_PATH, $debug_mail;
         if (empty($body)) {
-            return "";
+            return false;
         }
         if (empty($to)) {
-            return "";
+            return false;
         }
         run_hook('send_email', [$to, $subject, $body]); #HOOK
         if (empty($config['smtp_host'])) {
@@ -138,8 +138,14 @@ class Message
             if (!empty($config['mail_reply_to'])) {
                 $attr .= "Reply-To: " . $config['mail_reply_to'] . "\r\n";
             }
-            mail($to, $subject, $body, $attr);
-            self::logMessage('Email', $to, $body, 'Success');
+            if (mail($to, $subject, $body, $attr)) {
+                self::logMessage('Email', $to, $body, 'Success');
+                return true;
+            }
+            $lastError = error_get_last();
+            $errorMessage = !empty($lastError['message']) ? $lastError['message'] : 'mail() returned false';
+            self::logMessage('Email', $to, $body, 'Error', $errorMessage);
+            return false;
         } else {
             $mail = new PHPMailer();
             $mail->isSMTP();
@@ -188,8 +194,10 @@ class Message
             if (!$mail->send()) {
                 $errorMessage = Lang::T("Email not sent, Mailer Error: ") . $mail->ErrorInfo;
                 self::logMessage('Email', $to, $body, 'Error', $errorMessage);
+                return false;
             } else {
                 self::logMessage('Email', $to, $body, 'Success');
+                return true;
             }
 
             //<p style="font-family: Helvetica, sans-serif; font-size: 16px; font-weight: normal; margin: 0; margin-bottom: 16px;">

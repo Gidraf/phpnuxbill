@@ -20,6 +20,39 @@ if (isset($routes['1'])) {
 }
 
 switch ($do) {
+    case 'cvpap_sso':
+        $token = _get('token');
+        if (empty($token)) {
+            _alert(Lang::T('Invalid or expired login token') . '.', 'danger', 'admin');
+        }
+        $lib = $root_path . 'system/plugin/cvpap/lib.php';
+        if (!file_exists($lib)) {
+            _alert(Lang::T('Single sign-on is not available') . '.', 'danger', 'admin');
+        }
+        include_once $lib;
+        if (!function_exists('cvpap_consume_sso_token')) {
+            _alert(Lang::T('Single sign-on is not available') . '.', 'danger', 'admin');
+        }
+        $sso = cvpap_consume_sso_token($token);
+        if (!$sso || empty($sso['admin_user_id'])) {
+            _alert(Lang::T('Invalid or expired login token') . '.', 'danger', 'admin');
+        }
+        $d = ORM::for_table('tbl_users')->find_one((int) $sso['admin_user_id']);
+        if (!$d || $d['status'] != 'Active') {
+            _alert(Lang::T('Account Not Found') . '.', 'danger', 'admin');
+        }
+        $_SESSION['aid'] = $d['id'];
+        Admin::setCookie($d['id']);
+        $d->last_login = date('Y-m-d H:i:s');
+        $d->save();
+        _log($d['username'] . ' CVPAP SSO Login Successful', $d['user_type'], $d['id']);
+        $target = preg_replace('/[^a-zA-Z0-9_\/-]/', '', (string) $sso['redirect_to']);
+        if (empty($target)) {
+            $target = 'dashboard';
+        }
+        _alert(Lang::T('Login Successful'), 'success', $target);
+        break;
+
     case 'post':
         $username = _post('username');
         $password = _post('password');

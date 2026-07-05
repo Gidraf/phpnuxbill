@@ -40,6 +40,8 @@ function cvpap_api()
 {
     global $admin, $routes;
 
+    cvpap_ensure_schema();
+
     if (!isset($admin) || empty($admin['id']) || !in_array($admin['user_type'], ['SuperAdmin', 'Admin'])) {
         showResult(false, 'CVPAP bridge: unauthorized');
     }
@@ -85,6 +87,8 @@ function cvpap_api()
 function cvpap_settings()
 {
     global $admin;
+
+    cvpap_ensure_schema();
 
     _admin();
     $admin = Admin::_info();
