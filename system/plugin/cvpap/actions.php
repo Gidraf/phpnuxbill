@@ -397,16 +397,74 @@ function cvpap_act_customer_get($q)
 function cvpap_act_customer_create($q)
 {
     cvpap_require_params($q, ['username']);
-    $c = ORM::for_table('tbl_customers')->where('username', $q['username'])->find_one();
+
+    $username_raw = trim((string) $q['username']);
+    $username = $username_raw;
+    if (!preg_match('/[A-Za-z]/', $username_raw)) {
+        $normalized_username = cvpap_identity_digits($username_raw);
+        if ($normalized_username != '') {
+            $username = $normalized_username;
+        }
+    }
+    if ($username == '') {
+        throw new CvpapApiError('Invalid username');
+    }
+
+    $phone_raw = trim((string) cvpap_param($q, 'phonenumber', $username_raw));
+    $phone = cvpap_identity_digits($phone_raw);
+    if ($phone == '') {
+        $phone = $phone_raw;
+    }
+
+    $c = ORM::for_table('tbl_customers')->where('username', $username)->find_one();
+    if (!$c && $username_raw != $username) {
+        $c = ORM::for_table('tbl_customers')->where('username', $username_raw)->find_one();
+    }
+    if (!$c && $phone != '') {
+        $c = ORM::for_table('tbl_customers')->where('phonenumber', $phone)->find_one();
+    }
+    if (!$c && $phone_raw != '' && $phone_raw != $phone) {
+        $c = ORM::for_table('tbl_customers')->where('phonenumber', $phone_raw)->find_one();
+    }
+
     if ($c) {
+        $changed = false;
+        if ($c['username'] != $username) {
+            $dup = ORM::for_table('tbl_customers')->where('username', $username)->find_one();
+            if (!$dup || $dup['id'] == $c['id']) {
+                $c->username = $username;
+                $changed = true;
+            }
+        }
+        if ($phone != '' && $c['phonenumber'] != $phone) {
+            $c->phonenumber = $phone;
+            $changed = true;
+        }
+        if (!empty($q['fullname']) && $c['fullname'] != $q['fullname']) {
+            $c->fullname = $q['fullname'];
+            $changed = true;
+        }
+        if (!empty($q['email']) && $c['email'] != $q['email']) {
+            $c->email = $q['email'];
+            $changed = true;
+        }
+        if (!empty($q['address']) && $c['address'] != $q['address']) {
+            $c->address = $q['address'];
+            $changed = true;
+        }
+        if ($changed) {
+            $c->save();
+        }
+        cvpap_meta_tag('tbl_customers', $c['id'], $q);
         return ['id' => $c['id'], 'username' => $c['username'], 'password' => $c['password'], 'created' => false];
     }
+
     $password = cvpap_param($q, 'password', (string) rand(100000, 999999));
     $c = ORM::for_table('tbl_customers')->create();
-    $c->username = $q['username'];
+    $c->username = $username;
     $c->password = $password;
-    $c->fullname = cvpap_param($q, 'fullname', $q['username']);
-    $c->phonenumber = cvpap_param($q, 'phonenumber', $q['username']);
+    $c->fullname = cvpap_param($q, 'fullname', $username);
+    $c->phonenumber = $phone != '' ? $phone : ($phone_raw != '' ? $phone_raw : $username);
     $c->email = cvpap_param($q, 'email', '');
     $c->address = cvpap_param($q, 'address', '');
     $c->service_type = cvpap_param($q, 'service_type', 'Hotspot');
@@ -487,18 +545,41 @@ function cvpap_act_send_welcome($q)
 function cvpap_act_partner_upsert($q)
 {
     cvpap_require_params($q, ['username']);
-    $u = ORM::for_table('tbl_users')->where('username', $q['username'])->find_one();
+
+    $username = trim((string) $q['username']);
+    if ($username == '') {
+        throw new CvpapApiError('Invalid username');
+    }
+
+    $u = null;
+    $partner_id = cvpap_param($q, 'partner_id');
+    if (!empty($partner_id)) {
+        $user_id = cvpap_meta_find_tbl_id('tbl_users', $partner_id);
+        if (!empty($user_id)) {
+            $u = ORM::for_table('tbl_users')->find_one($user_id);
+        }
+    }
+    if (!$u) {
+        $u = ORM::for_table('tbl_users')->where('username', $username)->find_one();
+    }
+
     $created = false;
     if (!$u) {
         $u = ORM::for_table('tbl_users')->create();
-        $u->username = $q['username'];
+        $u->username = $username;
         $u->user_type = cvpap_param($q, 'user_type', 'Agent');
         $u->status = 'Active';
         $u->creationdate = date('Y-m-d H:i:s');
         // unusable random password until CVPAP pushes the real one
         $u->password = Password::_crypt(bin2hex(random_bytes(16)));
         $created = true;
+    } else if ($u['username'] != $username) {
+        $dup = ORM::for_table('tbl_users')->where('username', $username)->find_one();
+        if (!$dup || $dup['id'] == $u['id']) {
+            $u->username = $username;
+        }
     }
+
     foreach (['fullname', 'email', 'phone'] as $field) {
         if (!empty($q[$field])) {
             $u->$field = $q[$field];

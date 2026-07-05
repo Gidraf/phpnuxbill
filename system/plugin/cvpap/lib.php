@@ -171,6 +171,32 @@ function cvpap_meta_get($tbl, $tbl_id)
     return $m ? $m['value'] : '';
 }
 
+/**
+ * Resolve a table row id by CVPAP partner id stored in tbl_meta.
+ */
+function cvpap_meta_find_tbl_id($tbl, $partner_id)
+{
+    $pid = trim((string) $partner_id);
+    if ($pid == '') {
+        return '';
+    }
+    $m = ORM::for_table('tbl_meta')
+        ->where('tbl', $tbl)
+        ->where('name', 'cvpap_partner_id')
+        ->where('value', $pid)
+        ->order_by_desc('id')
+        ->find_one();
+    return $m ? $m['tbl_id'] : '';
+}
+
+/**
+ * Keep only digits for phone/username identity matching.
+ */
+function cvpap_identity_digits($value)
+{
+    return preg_replace('/\D+/', '', (string) $value);
+}
+
 /* ------------------------------------------------- password links & email */
 
 /**
