@@ -643,9 +643,23 @@ function cvpap_act_partner_upsert($q)
     }
 
     $partner_row = cvpap_partner_upsert_row($q, $admin_user_id);
+
+    // Provision (or refresh) the backing owner login unless the caller
+    // explicitly linked an existing admin user. Default is to auto-create the
+    // 'Partner'-type owner so the business owner can log into nuxbill/SSO.
+    $provision_owner = cvpap_param($q, 'provision_owner', true);
+    $owner_user_id = (int) $partner_row['admin_user_id'];
+    if ($provision_owner && $admin_user_id <= 0) {
+        $owner_user_id = cvpap_partner_ensure_owner_login($partner_row, $q);
+    } else if (!empty($q['password']) && $owner_user_id > 0) {
+        // password refresh for an already-linked owner
+        cvpap_partner_ensure_owner_login($partner_row, $q);
+    }
+
     return [
         'id' => $partner_row ? (int) $partner_row['id'] : 0,
         'username' => $partner_row ? $partner_row['username'] : '',
+        'admin_user_id' => $owner_user_id,
         'created' => $created,
         'partner' => $partner_row ? $partner_row->as_array() : null,
     ];

@@ -24,12 +24,80 @@ if (!function_exists('register_hook')) {
 
 include_once __DIR__ . DIRECTORY_SEPARATOR . 'cvpap' . DIRECTORY_SEPARATOR . 'lib.php';
 include_once __DIR__ . DIRECTORY_SEPARATOR . 'cvpap' . DIRECTORY_SEPARATOR . 'actions.php';
+include_once __DIR__ . DIRECTORY_SEPARATOR . 'cvpap' . DIRECTORY_SEPARATOR . 'console.php';
 
 register_hook('recharge_user_finish', 'cvpap_on_recharge_finish');
 register_hook('customer_activate_voucher', 'cvpap_on_voucher_activate');
 register_hook('cronjob_end', 'cvpap_on_cron_end');
 
 register_menu("CVPAP Bridge", true, "cvpap_settings", "SETTINGS", "ion-link", "", "", ['SuperAdmin', 'Admin']);
+register_menu("My Business", true, "cvpap_partner_console", "MAIN", "ion-briefcase", "", "", ['Partner', 'SuperAdmin', 'Admin']);
+
+/**
+ * Partner landing: a 'Partner'-type owner has no access to stock pages, so
+ * send them straight to their scoped console instead of the stock dashboard.
+ * Runs at plugin-load time (session already started in index.php).
+ */
+if (isset($_GET['_route'])) {
+    $__cvpap_land = explode('/', $_GET['_route']);
+    $__cvpap_land0 = isset($__cvpap_land[0]) ? $__cvpap_land[0] : '';
+    if (in_array($__cvpap_land0, ['', 'dashboard'], true) && class_exists('Admin')) {
+        $__cvpap_aid = Admin::getID();
+        if ($__cvpap_aid) {
+            $__cvpap_me = ORM::for_table('tbl_users')->find_one((int) $__cvpap_aid);
+            if ($__cvpap_me && $__cvpap_me['user_type'] === 'Partner') {
+                header('Location: ' . APP_URL . '/?_route=plugin/cvpap_partner_console');
+                exit();
+            }
+        }
+    }
+}
+
+/**
+ * SSO landing: consume a one-time token issued by partner_sso_issue and log
+ * the browser into the partner owner's scoped nuxbill session.
+ * URL: /?_route=admin/cvpap_sso&token=<token>
+ * The route matches because $routes[0]='admin' and $routes[1]='cvpap_sso' —
+ * but admin.php is a controller; we intercept early here on plugin load.
+ */
+if (isset($_GET['_route'])) {
+    $__cvpap_route = explode('/', $_GET['_route']);
+    if (isset($__cvpap_route[0], $__cvpap_route[1])
+        && $__cvpap_route[0] === 'admin' && $__cvpap_route[1] === 'cvpap_sso') {
+        cvpap_sso_login_handler();
+    }
+}
+
+function cvpap_sso_login_handler()
+{
+    $token = isset($_GET['token']) ? $_GET['token'] : '';
+    $session = cvpap_consume_sso_token($token);
+    if (!$session || empty($session['admin_user_id'])) {
+        header('Location: ' . APP_URL . '/?_route=admin&sso=invalid');
+        exit();
+    }
+    $admin = ORM::for_table('tbl_users')->find_one((int) $session['admin_user_id']);
+    if (!$admin) {
+        header('Location: ' . APP_URL . '/?_route=admin&sso=invalid');
+        exit();
+    }
+    // establish the nuxbill admin session (same mechanism admin.php login uses)
+    Admin::setCookie($admin['id']);
+    $_SESSION['aid'] = $admin['id'];
+    $admin->last_login = date('Y-m-d H:i:s');
+    $admin->save();
+    // _log() is defined later in init.php than the plugin-include block, so
+    // it may not exist yet at this point — guard it.
+    if (function_exists('_log')) {
+        _log($admin['username'] . ' CVPAP SSO login', $admin['user_type'], $admin['id']);
+    }
+
+    $redirect = !empty($session['redirect_to']) ? $session['redirect_to'] : 'dashboard';
+    // only allow internal relative routes
+    $redirect = preg_replace('/[^a-zA-Z0-9_\/-]/', '', $redirect);
+    header('Location: ' . APP_URL . '/?_route=' . $redirect);
+    exit();
+}
 
 /**
  * API dispatcher. Reached through system/api.php which already validated the

@@ -265,6 +265,21 @@ function cvpap_partner_uid($q, $required = false)
     return $partner_uid;
 }
 
+/**
+ * Resolve the tenant a nuxbill login owns (its scoped partner), or null for
+ * platform admins. Used by the scoped partner console.
+ */
+function cvpap_partner_by_admin($admin_user_id)
+{
+    cvpap_ensure_schema();
+    $admin_user_id = (int) $admin_user_id;
+    if ($admin_user_id <= 0) {
+        return null;
+    }
+    return ORM::for_table('tbl_cvpap_partners')
+        ->where('admin_user_id', $admin_user_id)->find_one();
+}
+
 function cvpap_partner_find($partner_uid)
 {
     cvpap_ensure_schema();
@@ -323,6 +338,69 @@ function cvpap_partner_upsert_row($q, $admin_user_id = 0)
     }
     $row->save();
     return $row;
+}
+
+/**
+ * Ensure the tenant has a backing tbl_users OWNER login (the business owner
+ * who logs into nuxbill directly, mirroring the CVPAP partner). Created with
+ * user_type='Partner' — a type NONE of nuxbill's stock data controllers
+ * authorize, so those pages auto-deny; the tenant's own scoped plugin pages
+ * are their workspace. Staff are synced separately as 'Agent'.
+ *
+ * $q may carry: username, fullname, email, phone, password, status.
+ * Returns the tbl_users id (also written to the tenant row's admin_user_id).
+ */
+function cvpap_partner_ensure_owner_login($row, $q)
+{
+    $owner = null;
+    if (!empty($row['admin_user_id'])) {
+        $owner = ORM::for_table('tbl_users')->find_one((int) $row['admin_user_id']);
+    }
+    // fall back to matching an existing user by the tenant username
+    if (!$owner && !empty($row['username'])) {
+        $owner = ORM::for_table('tbl_users')->where('username', $row['username'])->find_one();
+    }
+
+    $created = false;
+    if (!$owner) {
+        $owner = ORM::for_table('tbl_users')->create();
+        $owner->username = !empty($row['username']) ? $row['username']
+            : (!empty($row['email']) ? $row['email'] : 'partner_' . $row['partner_uid']);
+        $owner->user_type = 'Partner';   // deny-by-default in all stock controllers
+        $owner->creationdate = date('Y-m-d H:i:s');
+        // random placeholder until CVPAP forwards the real password
+        $owner->password = Password::_crypt(bin2hex(random_bytes(16)));
+        $created = true;
+    }
+
+    if (!empty($row['fullname'])) {
+        $owner->fullname = $row['fullname'];
+    }
+    if (!empty($row['email'])) {
+        $owner->email = $row['email'];
+    }
+    if (!empty($row['phone'])) {
+        $owner->phone = $row['phone'];
+    }
+    // keep the owner type as Partner unless it is a native admin already
+    if ($created || empty($owner->user_type)) {
+        $owner->user_type = 'Partner';
+    }
+    $status = cvpap_param($q, 'status', $row['status']);
+    if (in_array($status, ['Active', 'Inactive'])) {
+        $owner->status = $status;
+    }
+    if (!empty($q['password'])) {
+        $owner->password = Password::_crypt($q['password']);
+    }
+    $owner->save();
+
+    $owner_id = (int) $owner->id();
+    if ((int) $row['admin_user_id'] !== $owner_id) {
+        $row->admin_user_id = $owner_id;
+        $row->save();
+    }
+    return $owner_id;
 }
 
 function cvpap_partner_router_link($partner_uid, $router_id)

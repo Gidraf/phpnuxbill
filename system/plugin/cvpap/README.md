@@ -37,10 +37,20 @@ SSO consume route in nuxbill admin:
 Notes:
 
 - Existing actions still work as before.
-- `partner_upsert` updates only `tbl_cvpap_partners`; it no longer auto-creates
-  records in `tbl_users`.
-- To enable nuxbill SSO for a partner, link an existing local user by sending
-  `admin_user_id` in `partner_upsert`.
+- `partner_upsert` upserts `tbl_cvpap_partners` AND, unless
+  `provision_owner:false` or an explicit `admin_user_id` is passed,
+  auto-creates a backing **owner login** in `tbl_users` with
+  `user_type='Partner'`. That user_type is authorized by NONE of nuxbill's
+  stock data controllers (customers/plans/reports/routers all deny it), so
+  the owner is safely scoped: stock cross-tenant pages are denied, and only
+  the plugin's own partner-scoped pages / SSO session are usable. The
+  optional `password` field sets the owner's login password (forwarded from
+  CVPAP so the same credentials work on both systems).
+- Partner staff should be synced as `user_type='Agent'` linked to the same
+  `partner_uid` (Phase B scoped-views work).
+- SSO now works out of the box: `partner_sso_issue` uses the auto-created
+  owner (`admin_user_id`); the consume route is registered in `cvpap.php`
+  (see below).
 - Platform governance defaults are superadmin-owned: advanced settings,
   communications and billing are delegated to CVPAP superadmin.
 - When communications owner is `cvpap`, `password_link` / `send_welcome`
