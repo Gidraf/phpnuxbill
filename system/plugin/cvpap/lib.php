@@ -382,8 +382,11 @@ function cvpap_partner_ensure_owner_login($row, $q)
     if (!empty($row['phone'])) {
         $owner->phone = $row['phone'];
     }
-    // keep the owner type as Partner unless it is a native admin already
-    if ($created || empty($owner->user_type)) {
+    // Owners are ALWAYS 'Partner' (scoped, deny-by-default in stock pages).
+    // Enforce on every sync so a mistyped/legacy 'Agent'/'Sales' owner gets
+    // corrected — but never demote a genuine platform admin that was
+    // explicitly linked via admin_user_id.
+    if (!in_array($owner->user_type, ['SuperAdmin', 'Admin'])) {
         $owner->user_type = 'Partner';
     }
     $status = cvpap_param($q, 'status', $row['status']);
