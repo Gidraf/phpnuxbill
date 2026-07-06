@@ -1289,3 +1289,266 @@ function cvpap_recharge_result($username, $router, $p, $invoice, $password = '')
         'status' => $rec ? $rec['status'] : '',
     ];
 }
+
+/* ═══════════════════════════════════════════ completeness pass (core data ops) */
+
+/* ---- customers: delete + balance ---- */
+
+function cvpap_act_customer_delete($q)
+{
+    cvpap_require_params($q, ['customer_id']);
+    $c = ORM::for_table('tbl_customers')->find_one((int) $q['customer_id']);
+    if (!$c) {
+        throw new CvpapApiError('Customer not found');
+    }
+    $active = ORM::for_table('tbl_user_recharges')->where('customer_id', $c['id'])
+        ->where('status', 'on')->count();
+    if ($active > 0 && !cvpap_param($q, 'force', false)) {
+        throw new CvpapApiError("Customer has $active active subscription(s); pass force=true to delete anyway");
+    }
+    $id = $c['id'];
+    ORM::for_table('tbl_user_recharges')->where('customer_id', $id)->delete_many();
+    ORM::for_table('tbl_customers_fields')->where('customer_id', $id)->delete_many();
+    $c->delete();
+    return ['deleted' => $id];
+}
+
+function cvpap_act_customer_balance($q)
+{
+    cvpap_require_params($q, ['customer_id', 'amount']);
+    $c = ORM::for_table('tbl_customers')->find_one((int) $q['customer_id']);
+    if (!$c) {
+        throw new CvpapApiError('Customer not found');
+    }
+    $amount = (float) $q['amount'];
+    $op = cvpap_param($q, 'operation', 'add'); // add | deduct | set
+    if ($op === 'add') {
+        Balance::plus($c['id'], $amount);
+    } else if ($op === 'deduct') {
+        Balance::min($c['id'], $amount);
+    } else if ($op === 'set') {
+        $c->balance = $amount;
+        $c->save();
+    } else {
+        throw new CvpapApiError('operation must be add|deduct|set');
+    }
+    $fresh = ORM::for_table('tbl_customers')->find_one($c['id']);
+    return ['customer_id' => $c['id'], 'balance' => (float) $fresh['balance'], 'operation' => $op];
+}
+
+function cvpap_act_customer_fields($q)
+{
+    cvpap_require_params($q, ['customer_id']);
+    $cid = (int) $q['customer_id'];
+    if (array_key_exists('fields', $q) && is_array($q['fields'])) {
+        foreach ($q['fields'] as $name => $value) {
+            $f = ORM::for_table('tbl_customers_fields')->where('customer_id', $cid)
+                ->where('field_name', $name)->find_one();
+            if (!$f) {
+                $f = ORM::for_table('tbl_customers_fields')->create();
+                $f->customer_id = $cid;
+                $f->field_name = $name;
+            }
+            $f->field_value = $value;
+            $f->save();
+        }
+    }
+    $rows = ORM::for_table('tbl_customers_fields')->where('customer_id', $cid)->find_array();
+    $out = [];
+    foreach ($rows as $r) {
+        $out[$r['field_name']] = $r['field_value'];
+    }
+    return ['customer_id' => $cid, 'fields' => $out];
+}
+
+/* ---- vouchers: delete + print export ---- */
+
+function cvpap_act_voucher_delete($q)
+{
+    if (!empty($q['code'])) {
+        $v = ORM::for_table('tbl_voucher')->where('code', $q['code'])->find_one();
+    } else {
+        cvpap_require_params($q, ['id']);
+        $v = ORM::for_table('tbl_voucher')->find_one((int) $q['id']);
+    }
+    if (!$v) {
+        throw new CvpapApiError('Voucher not found');
+    }
+    if ($v['status'] == '1' && !cvpap_param($q, 'force', false)) {
+        throw new CvpapApiError('Voucher already used; pass force=true to delete');
+    }
+    cvpap_assert_router_in_scope($q, $v['routers']);
+    $id = $v['id'];
+    $v->delete();
+    return ['deleted' => $id];
+}
+
+function cvpap_act_voucher_print($q)
+{
+    $rows = ORM::for_table('tbl_voucher')
+        ->table_alias('v')
+        ->left_outer_join('tbl_plans', ['p.id', '=', 'v.id_plan'], 'p')
+        ->where_in('v.routers', cvpap_routers_scope($q))
+        ->select('v.code', 'code')->select('v.status', 'status')->select('v.routers', 'routers')
+        ->select('p.name_plan', 'plan')->select('p.price', 'price')
+        ->select('p.validity', 'validity')->select('p.validity_unit', 'validity_unit');
+    $status = cvpap_param($q, 'status');
+    if ($status !== null) {
+        $rows->where('v.status', $status);
+    }
+    if (!empty($q['codes']) && is_array($q['codes'])) {
+        $rows->where_in('v.code', $q['codes']);
+    }
+    return ['vouchers' => cvpap_rows($rows->limit(min((int) cvpap_param($q, 'limit', 500), 2000))->find_many())];
+}
+
+/* ---- IP pools (tbl_pool) ---- */
+
+function cvpap_act_pool_list($q)
+{
+    $query = ORM::for_table('tbl_pool');
+    $scope = cvpap_routers_scope($q, false);
+    if (count($scope) > 0) {
+        $query->where_in('routers', $scope);
+    }
+    return ['pools' => cvpap_rows($query->find_many())];
+}
+
+function cvpap_act_pool_create($q)
+{
+    // `router` = the target router; `routers` = the partner scope list
+    cvpap_require_params($q, ['pool_name', 'range_ip', 'router']);
+    cvpap_assert_router_in_scope($q, $q['router']);
+    $p = ORM::for_table('tbl_pool')->create();
+    $p->pool_name = $q['pool_name'];
+    $p->local_ip = cvpap_param($q, 'local_ip', '');
+    $p->range_ip = $q['range_ip'];
+    $p->routers = $q['router'];
+    $p->save();
+    return ['id' => $p->id(), 'pool_name' => $p['pool_name'], 'router' => $q['router']];
+}
+
+function cvpap_act_pool_delete($q)
+{
+    cvpap_require_params($q, ['id']);
+    $p = ORM::for_table('tbl_pool')->find_one((int) $q['id']);
+    if (!$p) {
+        throw new CvpapApiError('Pool not found');
+    }
+    cvpap_assert_router_in_scope($q, $p['routers']);
+    $id = $p['id'];
+    $p->delete();
+    return ['deleted' => $id];
+}
+
+/* ---- coupons (tbl_coupons) ---- */
+
+function cvpap_act_coupon_list($q)
+{
+    return ['coupons' => cvpap_rows(ORM::for_table('tbl_coupons')->order_by_desc('id')
+        ->limit(min((int) cvpap_param($q, 'limit', 200), 1000))->find_many())];
+}
+
+function cvpap_act_coupon_create($q)
+{
+    cvpap_require_params($q, ['code', 'type', 'value']);
+    if (!in_array($q['type'], ['fixed', 'percent'])) {
+        throw new CvpapApiError('type must be fixed|percent');
+    }
+    if (ORM::for_table('tbl_coupons')->where('code', $q['code'])->find_one()) {
+        throw new CvpapApiError('Coupon code already exists');
+    }
+    $c = ORM::for_table('tbl_coupons')->create();
+    $c->code = $q['code'];
+    $c->type = $q['type'];
+    $c->value = (float) $q['value'];
+    $c->description = cvpap_param($q, 'description', '');
+    $c->max_usage = (int) cvpap_param($q, 'max_usage', 1);
+    $c->usage_count = 0;
+    $c->status = cvpap_param($q, 'status', 'active');
+    $c->min_order_amount = (float) cvpap_param($q, 'min_order_amount', 0);
+    $c->max_discount_amount = (float) cvpap_param($q, 'max_discount_amount', 0);
+    $c->start_date = cvpap_param($q, 'start_date', date('Y-m-d'));
+    $c->end_date = cvpap_param($q, 'end_date', date('Y-m-d', strtotime('+1 year')));
+    $c->save();
+    return ['id' => $c->id(), 'code' => $c['code']];
+}
+
+function cvpap_act_coupon_delete($q)
+{
+    cvpap_require_params($q, ['id']);
+    $c = ORM::for_table('tbl_coupons')->find_one((int) $q['id']);
+    if (!$c) {
+        throw new CvpapApiError('Coupon not found');
+    }
+    $id = $c['id'];
+    $c->delete();
+    return ['deleted' => $id];
+}
+
+/* ---- app settings (tbl_appconfig) ---- */
+
+// keys the bridge refuses to expose/overwrite (secrets / bridge internals)
+function cvpap_appconfig_blocked()
+{
+    return ['api_key', 'cvpap_shared_secret', 'db_password', 'radius_pass'];
+}
+
+function cvpap_act_appconfig_get($q)
+{
+    $blocked = cvpap_appconfig_blocked();
+    if (!empty($q['setting'])) {
+        if (in_array($q['setting'], $blocked)) {
+            throw new CvpapApiError('That setting is not readable via the bridge');
+        }
+        $row = ORM::for_table('tbl_appconfig')->where('setting', $q['setting'])->find_one();
+        return ['setting' => $q['setting'], 'value' => $row ? $row['value'] : null];
+    }
+    $out = [];
+    foreach (ORM::for_table('tbl_appconfig')->find_array() as $r) {
+        if (!in_array($r['setting'], $blocked)) {
+            $out[$r['setting']] = $r['value'];
+        }
+    }
+    return ['settings' => $out];
+}
+
+function cvpap_act_appconfig_set($q)
+{
+    cvpap_require_params($q, ['setting', 'value']);
+    if (in_array($q['setting'], cvpap_appconfig_blocked())) {
+        throw new CvpapApiError('That setting cannot be changed via the bridge');
+    }
+    cvpap_save_cfg($q['setting'], $q['value']);
+    return ['setting' => $q['setting'], 'value' => $q['value']];
+}
+
+/* ---- invoice / receipt for a transaction ---- */
+
+function cvpap_act_invoice_get($q)
+{
+    if (!empty($q['invoice'])) {
+        $t = ORM::for_table('tbl_transactions')->where('invoice', $q['invoice'])->find_one();
+    } else {
+        cvpap_require_params($q, ['id']);
+        $t = ORM::for_table('tbl_transactions')->find_one((int) $q['id']);
+    }
+    if (!$t) {
+        throw new CvpapApiError('Transaction not found');
+    }
+    cvpap_assert_router_in_scope($q, $t['routers']);
+    $cust = ORM::for_table('tbl_customers')->where('username', $t['username'])->find_one();
+    return ['invoice' => [
+        'invoice' => $t['invoice'],
+        'username' => $t['username'],
+        'fullname' => $cust ? $cust['fullname'] : '',
+        'plan_name' => $t['plan_name'],
+        'type' => $t['type'],
+        'price' => (float) $t['price'],
+        'method' => $t['method'],
+        'router' => $t['routers'],
+        'created_on' => $t['recharged_on'] . ' ' . $t['recharged_time'],
+        'expiration' => $t['expiration'] . ' ' . $t['time'],
+        'note' => $t['note'],
+    ]];
+}
