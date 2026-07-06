@@ -206,6 +206,33 @@ function cvpap_ensure_schema()
             KEY `idx_sso_partner_expires` (`partner_uid`,`expires_at`),
             KEY `idx_sso_admin` (`admin_user_id`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci");
+
+        // The partner OWNER login uses user_type='Partner', but nuxbill's
+        // stock tbl_users.user_type ENUM does not include it. Extend the ENUM
+        // (idempotent — re-running MODIFY with the same definition is a no-op)
+        // so the value is accepted; stock controllers still deny 'Partner'
+        // because it is absent from their SuperAdmin/Admin/Agent/Sales lists.
+        cvpap_add_partner_user_type();
+}
+
+/**
+ * Add 'Partner' to tbl_users.user_type ENUM if missing (safe to call often).
+ */
+function cvpap_add_partner_user_type()
+{
+    try {
+        $col = ORM::for_table('tbl_users')->raw_query(
+            "SHOW COLUMNS FROM `tbl_users` LIKE 'user_type'")->find_one();
+        $type = $col ? (isset($col['Type']) ? $col['Type'] : '') : '';
+        if ($type && stripos($type, "'Partner'") === false) {
+            $inner = trim(substr($type, strpos($type, '(') + 1), '()');
+            cvpap_sql("ALTER TABLE `tbl_users` MODIFY `user_type` "
+                . "ENUM($inner,'Partner') CHARACTER SET utf8mb4 "
+                . "COLLATE utf8mb4_general_ci NOT NULL");
+        }
+    } catch (Throwable $e) {
+        // non-fatal: if we cannot alter, owner creation will fall back to Agent
+    }
 }
 
 /* ------------------------------------------------------------- requests */
