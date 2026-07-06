@@ -81,7 +81,18 @@ function cvpap_partner_console()
     $money = function ($v) { return 'KSh ' . number_format((float) $v, 0); };
     $esc = function ($v) { return htmlspecialchars((string) $v); };
 
-    $html = '<div class="cards">'
+    // Info banner — management lives in CVPAP; this console is a scoped view.
+    $dash = cvpap_cfg('cvpap_dashboard_url', '');
+    $dashLink = $dash
+        ? ' <a href="' . htmlspecialchars($dash) . '" style="color:#93c5fd">Open your CVPAP dashboard &rarr;</a>'
+        : '';
+    $html = '<div style="background:#1e293b;border:1px solid #334155;border-radius:12px;'
+        . 'padding:14px 18px;margin-bottom:18px;color:#cbd5e1;font-size:14px">'
+        . '&#8505;&#65039; This is your read-only WiFi overview. To add routers, create packages, '
+        . 'generate vouchers or run reports, use your <b>CVPAP dashboard &rarr; WiFi Billing</b>.'
+        . $dashLink . '</div>';
+
+    $html .= '<div class="cards">'
         . cvpap_card('Routers', count($routerRows))
         . cvpap_card('Active subscriptions', $activeCount)
         . cvpap_card('Customers', count($custLinks))
