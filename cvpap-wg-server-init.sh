@@ -61,7 +61,12 @@ wg show "$WG_IF" >/dev/null 2>&1 || { echo "ERROR: $WG_IF not up. Check: systemc
 SERVER_PUB="$(cat "$WG_DIR/server.pub")"
 
 # ── 2. install the peer agent + timer ────────────────────────────────────────
+# The CVPAP container runs as a non-root user (appuser) and must be able to drop
+# peer requests here. The earlier `umask 077` would make this 700/root-only, so
+# force a shared, sticky-writable spool (like /tmp): container writes, root agent
+# applies. Without this you get "Permission denied … wg-spool/peer-*.json".
 mkdir -p "$SPOOL_DIR"
+chmod 1777 "$SPOOL_DIR"
 if [ -f "$AGENT_SRC" ]; then
   install -m 0755 "$AGENT_SRC" /usr/local/bin/cvpap-wg-agent.sh
 else
@@ -105,7 +110,7 @@ cat <<EOF
  1. Put these in the CVPAP container environment (web + celery), then restart:
 
       WG_SERVER_PUBKEY=${SERVER_PUB}
-      WG_SERVER_ENDPOINT=$(curl -s ifconfig.me 2>/dev/null || echo '<THIS_SERVER_PUBLIC_IP>')
+      WG_SERVER_ENDPOINT=$(curl -4 -s ifconfig.me 2>/dev/null || curl -s ipv4.icanhazip.com 2>/dev/null || echo '<THIS_SERVER_PUBLIC_IPv4>')
       WG_SERVER_PORT=${SERVER_PORT}
       WG_TUNNEL_NET=${TUNNEL_NET}
       WG_SPOOL_DIR=${SPOOL_DIR}
