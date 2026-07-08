@@ -11,10 +11,15 @@
 # The container joins CVPAP's compose network so the CVPAP backend reaches it
 # at http://nuxbill/system/api.php without publishing the API anywhere.
 
+# Explicit project name so a symlinked compose file can't derive an unstable
+# name (otherwise `up` looks for nuxbill-nuxbill:latest and misses the build).
+name: nuxbill
+
 services:
   nuxbill:
     container_name: nuxbill
     build: ./
+    image: nuxbill:latest    # pin the built image name → build & run always agree
     restart: unless-stopped
     ports:
       - "127.0.0.1:39090:80"   # admin UI: loopback-only, access via SSH tunnel
