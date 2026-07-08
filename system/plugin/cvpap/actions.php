@@ -185,6 +185,62 @@ function cvpap_act_disconnect_user($q)
     return ['disconnected' => $q['username'], 'router' => $q['router']];
 }
 
+/**
+ * Install the CVPAP captive-portal redirect as the hotspot login page.
+ * Runs `/tool/fetch` on the router (over the tunnel) to pull login.html from
+ * CVPAP straight into the hotspot/ folder — so the partner never touches the
+ * terminal. Requires the hotspot to already be set up (the hotspot/ dir exists).
+ */
+function cvpap_act_hotspot_install_page($q)
+{
+    cvpap_require_params($q, ['router', 'login_url']);
+    cvpap_assert_router_in_scope($q, $q['router']);
+    $router = Mikrotik::info($q['router']);
+    if (!$router) {
+        throw new CvpapApiError('Router not found');
+    }
+    $dst = isset($q['dst_path']) && $q['dst_path'] !== '' ? $q['dst_path'] : 'hotspot/login.html';
+
+    $client = Mikrotik::getClient($router['ip_address'], $router['username'], $router['password']);
+    if ($client === null) { // demo/offline mode
+        return ['installed' => false, 'router' => $q['router'], 'demo' => true];
+    }
+
+    $request = new PEAR2\Net\RouterOS\Request('/tool/fetch');
+    $request->setArgument('url', $q['login_url']);
+    $request->setArgument('dst-path', $dst);
+    // https so the router validates the CVPAP cert; check-certificate off avoids
+    // failures on routers without an up-to-date CA bundle.
+    $request->setArgument('mode', 'https');
+    $request->setArgument('check-certificate', 'no');
+
+    $status = null;
+    $error = null;
+    try {
+        $responses = $client->sendSync($request);
+        foreach ($responses as $response) {
+            if ($response->getType() === PEAR2\Net\RouterOS\Response::TYPE_ERROR) {
+                $error = $response->getProperty('message') ?: 'fetch failed';
+            }
+            $s = $response->getProperty('status');
+            if ($s) {
+                $status = $s;
+            }
+        }
+    } catch (Throwable $e) {
+        throw new CvpapApiError('Could not install portal page: ' . $e->getMessage());
+    }
+    if ($error) {
+        throw new CvpapApiError('Router rejected the fetch: ' . $error);
+    }
+    return [
+        'installed' => true,
+        'router' => $q['router'],
+        'dst_path' => $dst,
+        'status' => $status ?: 'finished',
+    ];
+}
+
 /* ------------------------------------------------------------- bandwidth */
 
 function cvpap_act_bandwidth_list($q)
