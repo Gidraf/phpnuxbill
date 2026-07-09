@@ -1011,6 +1011,7 @@ function cvpap_act_recharge($q)
     if (!$inv) {
         throw new CvpapApiError('Recharge failed');
     }
+    cvpap_verify_hotspot_user($q['router'], $p, $c['username'], $c['password']);
     $partner_uid = cvpap_partner_uid($q, false);
     if ($partner_uid != '') {
         cvpap_partner_customer_link(
@@ -1028,6 +1029,39 @@ function cvpap_act_recharge($q)
  * then recharge — one atomic call for the CVPAP purchase flow. Records the
  * full plan price in tbl_transactions so nuxbill reports show real revenue.
  */
+/**
+ * After a recharge, confirm the hotspot user actually landed on the router and
+ * force its password to exactly what we hand the buyer. Heals silent drift
+ * (stale manually-added users, out-of-band password changes) and turns
+ * "paid but can't log in" into a loud provisioning error instead.
+ */
+function cvpap_verify_hotspot_user($router_name, $plan, $username, $password)
+{
+    if ($plan['device'] != 'MikrotikHotspot') {
+        return ['verified' => false, 'skipped' => 'device ' . $plan['device']];
+    }
+    $router = Mikrotik::info($router_name);
+    if (!$router) {
+        return ['verified' => false, 'skipped' => 'router missing'];
+    }
+    $client = Mikrotik::getClient($router['ip_address'], $router['username'], $router['password']);
+    if ($client === null) { // demo mode
+        return ['verified' => false, 'skipped' => 'demo'];
+    }
+    $printRequest = new PEAR2\Net\RouterOS\Request('/ip/hotspot/user/print');
+    $printRequest->setArgument('.proplist', '.id');
+    $printRequest->setQuery(PEAR2\Net\RouterOS\Query::where('name', $username));
+    $id = $client->sendSync($printRequest)->getProperty('.id');
+    if (empty($id)) {
+        throw new CvpapApiError(
+            "Recharge saved but hotspot user [$username] did not reach router [$router_name] — check the router connection and plan device"
+        );
+    }
+    Mikrotik::setHotspotUser($client, $username, $password);
+    return ['verified' => true];
+}
+
+
 function cvpap_act_portal_provision($q)
 {
     cvpap_require_params($q, ['phone', 'router', 'plan_id']);
@@ -1049,7 +1083,10 @@ function cvpap_act_portal_provision($q)
     if (!$inv) {
         throw new CvpapApiError('Recharge failed');
     }
-    return cvpap_recharge_result($created['username'], $q['router'], $p, $inv, $created['password']);
+    $verify = cvpap_verify_hotspot_user($q['router'], $p, $created['username'], $created['password']);
+    $res = cvpap_recharge_result($created['username'], $q['router'], $p, $inv, $created['password']);
+    $res['router_user_verified'] = $verify;
+    return $res;
 }
 
 /* -------------------------------------------------------------- vouchers */
