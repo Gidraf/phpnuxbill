@@ -185,6 +185,120 @@ function cvpap_act_disconnect_user($q)
     return ['disconnected' => $q['username'], 'router' => $q['router']];
 }
 
+/* ------------------------------------------------- hotspot bypass devices */
+
+function cvpap_bypass_client($q)
+{
+    cvpap_require_params($q, ['router']);
+    cvpap_assert_router_in_scope($q, $q['router']);
+    $router = Mikrotik::info($q['router']);
+    if (!$router) {
+        throw new CvpapApiError('Router not found');
+    }
+    return Mikrotik::getClient($router['ip_address'], $router['username'], $router['password']);
+}
+
+/**
+ * List hotspot ip-bindings plus currently-seen hosts (so the dashboard can
+ * offer a picker instead of asking people to find MAC addresses by hand).
+ */
+function cvpap_act_bypass_list($q)
+{
+    $client = cvpap_bypass_client($q);
+    if ($client === null) { // demo mode
+        return ['bindings' => [], 'hosts' => [], 'demo' => true];
+    }
+    $bindings = [];
+    $responses = $client->sendSync(new PEAR2\Net\RouterOS\Request('/ip/hotspot/ip-binding/print'));
+    foreach ($responses as $r) {
+        if ($r->getType() === PEAR2\Net\RouterOS\Response::TYPE_DATA) {
+            $bindings[] = [
+                'id' => $r->getProperty('.id'),
+                'mac_address' => $r->getProperty('mac-address'),
+                'address' => $r->getProperty('address'),
+                'type' => $r->getProperty('type'),
+                'comment' => $r->getProperty('comment'),
+            ];
+        }
+    }
+    $hosts = [];
+    $responses = $client->sendSync(new PEAR2\Net\RouterOS\Request('/ip/hotspot/host/print'));
+    foreach ($responses as $r) {
+        if ($r->getType() === PEAR2\Net\RouterOS\Response::TYPE_DATA) {
+            $hosts[] = [
+                'mac_address' => $r->getProperty('mac-address'),
+                'address' => $r->getProperty('address'),
+            ];
+        }
+    }
+    return ['bindings' => $bindings, 'hosts' => $hosts];
+}
+
+/**
+ * Bypass a device: it skips the captive portal login entirely (owner laptops,
+ * office printers, CCTV...). Idempotent per MAC. Works any time the router is
+ * reachable - before or after the hotspot itself is configured (bindings
+ * simply sit there until a hotspot uses them, and persist across reboots).
+ */
+function cvpap_act_bypass_add($q)
+{
+    cvpap_require_params($q, ['router', 'mac']);
+    $mac = strtoupper(trim($q['mac']));
+    if (!preg_match('/^([0-9A-F]{2}[:-]){5}[0-9A-F]{2}$/', $mac)) {
+        throw new CvpapApiError('Invalid MAC address - use the format AA:BB:CC:DD:EE:FF');
+    }
+    $mac = str_replace('-', ':', $mac);
+    $client = cvpap_bypass_client($q);
+    if ($client === null) {
+        return ['added' => false, 'demo' => true];
+    }
+    // replace any existing binding for this MAC (idempotent)
+    $printRequest = new PEAR2\Net\RouterOS\Request('/ip/hotspot/ip-binding/print');
+    $printRequest->setArgument('.proplist', '.id');
+    $printRequest->setQuery(PEAR2\Net\RouterOS\Query::where('mac-address', $mac));
+    $id = $client->sendSync($printRequest)->getProperty('.id');
+    if (!empty($id)) {
+        $rm = new PEAR2\Net\RouterOS\Request('/ip/hotspot/ip-binding/remove');
+        $rm->setArgument('numbers', $id);
+        $client->sendSync($rm);
+    }
+    $label = trim((string) cvpap_param($q, 'label', ''));
+    $add = new PEAR2\Net\RouterOS\Request('/ip/hotspot/ip-binding/add');
+    $add->setArgument('mac-address', $mac);
+    $add->setArgument('type', 'bypassed');
+    $add->setArgument('comment', 'cvpap: ' . ($label !== '' ? $label : 'bypassed device'));
+    foreach ($client->sendSync($add) as $r) {
+        if ($r->getType() === PEAR2\Net\RouterOS\Response::TYPE_ERROR) {
+            throw new CvpapApiError('Router rejected the binding: ' . $r->getProperty('message'));
+        }
+    }
+    return ['added' => true, 'mac_address' => $mac, 'label' => $label];
+}
+
+function cvpap_act_bypass_remove($q)
+{
+    cvpap_require_params($q, ['router', 'mac']);
+    $mac = strtoupper(str_replace('-', ':', trim($q['mac'])));
+    $client = cvpap_bypass_client($q);
+    if ($client === null) {
+        return ['removed' => 0, 'demo' => true];
+    }
+    $printRequest = new PEAR2\Net\RouterOS\Request('/ip/hotspot/ip-binding/print');
+    $printRequest->setArgument('.proplist', '.id');
+    $printRequest->setQuery(PEAR2\Net\RouterOS\Query::where('mac-address', $mac));
+    $removed = 0;
+    foreach ($client->sendSync($printRequest) as $r) {
+        if ($r->getType() === PEAR2\Net\RouterOS\Response::TYPE_DATA) {
+            $rm = new PEAR2\Net\RouterOS\Request('/ip/hotspot/ip-binding/remove');
+            $rm->setArgument('numbers', $r->getProperty('.id'));
+            $client->sendSync($rm);
+            $removed++;
+        }
+    }
+    return ['removed' => $removed, 'mac_address' => $mac];
+}
+
+
 /**
  * Install the CVPAP captive-portal redirect as the hotspot login page.
  * Runs `/tool/fetch` on the router (over the tunnel) to pull login.html from
