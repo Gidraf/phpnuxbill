@@ -340,7 +340,7 @@ function cvpap_act_bypass_remove($q)
  */
 function cvpap_act_hotspot_install_page($q)
 {
-    cvpap_require_params($q, ['router', 'login_url']);
+    cvpap_require_params($q, ['router']);
     cvpap_assert_router_in_scope($q, $q['router']);
     $router = Mikrotik::info($q['router']);
     if (!$router) {
@@ -353,11 +353,45 @@ function cvpap_act_hotspot_install_page($q)
         return ['installed' => false, 'router' => $q['router'], 'demo' => true];
     }
 
+    // Preferred: write the page CONTENT straight onto the router over the tunnel
+    // (/file set). No router WAN internet or DNS needed — the router only has to
+    // be reachable over WireGuard. Falls back to /tool fetch if no content given.
+    if (isset($q['content']) && $q['content'] !== '') {
+        // the file must exist before its contents can be set — create it empty
+        // if the hotspot dir doesn't already have login.html
+        $printRequest = new PEAR2\Net\RouterOS\Request('/file/print');
+        $printRequest->setArgument('.proplist', '.id');
+        $printRequest->setQuery(PEAR2\Net\RouterOS\Query::where('name', $dst));
+        $id = $client->sendSync($printRequest)->getProperty('.id');
+        if (empty($id)) {
+            // /file add creates an editable text file we can then set contents on
+            $add = new PEAR2\Net\RouterOS\Request('/file/add');
+            $add->setArgument('name', $dst);
+            $add->setArgument('type', 'file');
+            try { $client->sendSync($add); } catch (Throwable $e) {}
+            $id = $client->sendSync($printRequest)->getProperty('.id');
+        }
+        if (empty($id)) {
+            throw new CvpapApiError("Could not create $dst on the router");
+        }
+        $set = new PEAR2\Net\RouterOS\Request('/file/set');
+        $set->setArgument('numbers', $id);
+        $set->setArgument('contents', $q['content']);
+        foreach ($client->sendSync($set) as $r) {
+            if ($r->getType() === PEAR2\Net\RouterOS\Response::TYPE_ERROR) {
+                throw new CvpapApiError('Router rejected the page write: ' . $r->getProperty('message'));
+            }
+        }
+        return ['installed' => true, 'router' => $q['router'], 'dst_path' => $dst, 'method' => 'api-write'];
+    }
+
+    // Fallback: tell the router to fetch it (needs router WAN internet + DNS).
+    if (empty($q['login_url'])) {
+        throw new CvpapApiError('No content or login_url provided');
+    }
     $request = new PEAR2\Net\RouterOS\Request('/tool/fetch');
     $request->setArgument('url', $q['login_url']);
     $request->setArgument('dst-path', $dst);
-    // https so the router validates the CVPAP cert; check-certificate off avoids
-    // failures on routers without an up-to-date CA bundle.
     $request->setArgument('mode', 'https');
     $request->setArgument('check-certificate', 'no');
 
@@ -385,6 +419,7 @@ function cvpap_act_hotspot_install_page($q)
         'router' => $q['router'],
         'dst_path' => $dst,
         'status' => $status ?: 'finished',
+        'method' => 'fetch',
     ];
 }
 
