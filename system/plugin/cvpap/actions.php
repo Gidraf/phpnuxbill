@@ -185,6 +185,39 @@ function cvpap_act_disconnect_user($q)
     return ['disconnected' => $q['username'], 'router' => $q['router']];
 }
 
+/**
+ * Tunnel health check: can nuxbill actually reach a MikroTik at ip:port with
+ * the given API creds? Used during onboarding so we only register a router
+ * once its tunnel really works (a dead tunnel = paid-but-no-access later).
+ * Does NOT require the router to be registered yet.
+ */
+function cvpap_act_tunnel_check($q)
+{
+    cvpap_require_params($q, ['ip_address', 'username', 'password']);
+    $started = microtime(true);
+    try {
+        $client = Mikrotik::getClient($q['ip_address'], $q['username'], $q['password']);
+        if ($client === null) {
+            return ['reachable' => false, 'demo' => true];
+        }
+        $resp = $client->sendSync(new PEAR2\Net\RouterOS\Request('/system/identity/print'));
+        $identity = '';
+        foreach ($resp as $r) {
+            if ($r->getType() === PEAR2\Net\RouterOS\Response::TYPE_DATA) {
+                $identity = $r->getProperty('name');
+            }
+        }
+        return [
+            'reachable' => true,
+            'identity' => $identity,
+            'latency_ms' => (int) round((microtime(true) - $started) * 1000),
+        ];
+    } catch (Throwable $e) {
+        return ['reachable' => false, 'error' => $e->getMessage()];
+    }
+}
+
+
 /* ------------------------------------------------- hotspot bypass devices */
 
 function cvpap_bypass_client($q)
@@ -1198,9 +1231,49 @@ function cvpap_act_portal_provision($q)
         throw new CvpapApiError('Recharge failed');
     }
     $verify = cvpap_verify_hotspot_user($q['router'], $p, $created['username'], $created['password']);
+    // Server-side login by MAC+IP: authenticate the exact device that paid, so
+    // the customer is online immediately without the browser having to submit
+    // the hotspot login form (which is unreliable HTTPS->HTTP). The device is
+    // identified by its MAC (stable) + current IP; the phone stays the label.
+    $login = cvpap_hotspot_autologin($q['router'], $p, $created['username'], $created['password'],
+        cvpap_param($q, 'mac', ''), cvpap_param($q, 'ip', ''));
     $res = cvpap_recharge_result($created['username'], $q['router'], $p, $inv, $created['password']);
     $res['router_user_verified'] = $verify;
+    $res['auto_login'] = $login;
     return $res;
+}
+
+/**
+ * Log a paid device into the hotspot server-side, by its MAC + IP. Best-effort:
+ * a failure here doesn't fail the purchase (the customer still has valid creds
+ * and the browser fallback), it just means they may tap "Connect" once.
+ */
+function cvpap_hotspot_autologin($router_name, $plan, $username, $password, $mac, $ip)
+{
+    if ($plan['device'] != 'MikrotikHotspot') {
+        return ['ok' => false, 'skipped' => 'device ' . $plan['device']];
+    }
+    $mac = strtoupper(str_replace('-', ':', trim((string) $mac)));
+    $ip = trim((string) $ip);
+    if (!preg_match('/^([0-9A-F]{2}:){5}[0-9A-F]{2}$/', $mac) || $ip === '') {
+        return ['ok' => false, 'skipped' => 'no mac/ip'];
+    }
+    try {
+        $router = Mikrotik::info($router_name);
+        if (!$router) {
+            return ['ok' => false, 'error' => 'router missing'];
+        }
+        $client = Mikrotik::getClient($router['ip_address'], $router['username'], $router['password']);
+        if ($client === null) {
+            return ['ok' => false, 'skipped' => 'demo'];
+        }
+        // clear any stale session for this user first so the fresh login sticks
+        try { Mikrotik::logMeOut($client, $username); } catch (Throwable $e) {}
+        Mikrotik::logMeIn($client, $username, $password, $ip, $mac);
+        return ['ok' => true, 'mac' => $mac, 'ip' => $ip];
+    } catch (Throwable $e) {
+        return ['ok' => false, 'error' => $e->getMessage()];
+    }
 }
 
 /* -------------------------------------------------------------- vouchers */
