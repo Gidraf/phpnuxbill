@@ -218,6 +218,42 @@ function cvpap_act_tunnel_check($q)
 }
 
 
+/**
+ * Recent /log entries from a router (over the tunnel) so the onboarding wizard
+ * can show the router's own view: wireguard handshakes, hotspot logins, dhcp.
+ * Connects by ip:port + creds directly (works before the router is registered).
+ */
+function cvpap_act_router_log($q)
+{
+    cvpap_require_params($q, ['ip_address', 'username', 'password']);
+    $limit = (int) cvpap_param($q, 'limit', 40);
+    if ($limit < 1) { $limit = 40; }
+    if ($limit > 200) { $limit = 200; }
+    try {
+        $client = Mikrotik::getClient($q['ip_address'], $q['username'], $q['password']);
+        if ($client === null) {
+            return ['reachable' => false, 'demo' => true, 'log' => []];
+        }
+        $rows = [];
+        $responses = $client->sendSync(new PEAR2\Net\RouterOS\Request('/log/print'));
+        foreach ($responses as $r) {
+            if ($r->getType() === PEAR2\Net\RouterOS\Response::TYPE_DATA) {
+                $rows[] = [
+                    'time' => $r->getProperty('time'),
+                    'topics' => $r->getProperty('topics'),
+                    'message' => $r->getProperty('message'),
+                ];
+            }
+        }
+        // most recent last in RouterOS; return the tail
+        $rows = array_slice($rows, -$limit);
+        return ['reachable' => true, 'log' => $rows];
+    } catch (Throwable $e) {
+        return ['reachable' => false, 'error' => $e->getMessage(), 'log' => []];
+    }
+}
+
+
 /* ------------------------------------------------- hotspot bypass devices */
 
 function cvpap_bypass_client($q)
