@@ -1250,8 +1250,8 @@ function cvpap_act_recharge($q)
 /**
  * After a recharge, confirm the hotspot user actually landed on the router and
  * force its password to exactly what we hand the buyer. Heals silent drift
- * (stale manually-added users, out-of-band password changes) and turns
- * "paid but can't log in" into a loud provisioning error instead.
+ * (stale manually-added users, out-of-band password changes). Best effort:
+ * a delayed router sync should not fail a paid purchase.
  */
 function cvpap_verify_hotspot_user($router_name, $plan, $username, $password)
 {
@@ -1266,16 +1266,37 @@ function cvpap_verify_hotspot_user($router_name, $plan, $username, $password)
     if ($client === null) { // demo mode
         return ['verified' => false, 'skipped' => 'demo'];
     }
-    $printRequest = new PEAR2\Net\RouterOS\Request('/ip/hotspot/user/print');
-    $printRequest->setArgument('.proplist', '.id');
-    $printRequest->setQuery(PEAR2\Net\RouterOS\Query::where('name', $username));
-    $id = $client->sendSync($printRequest)->getProperty('.id');
-    if (empty($id)) {
-        throw new CvpapApiError(
-            "Recharge saved but hotspot user [$username] did not reach router [$router_name] — check the router connection and plan device"
-        );
+
+    // RouterOS can lag briefly right after recharge/customer create. Recheck a
+    // few times so we do not mark paid purchases as failed during propagation.
+    $id = '';
+    $attempts = 4;
+    for ($i = 0; $i < $attempts; $i++) {
+        $printRequest = new PEAR2\Net\RouterOS\Request('/ip/hotspot/user/print');
+        $printRequest->setArgument('.proplist', '.id');
+        $printRequest->setQuery(PEAR2\Net\RouterOS\Query::where('name', $username));
+        $id = $client->sendSync($printRequest)->getProperty('.id');
+        if (!empty($id)) {
+            break;
+        }
+        if ($i < $attempts - 1) {
+            usleep(400000);
+        }
     }
-    Mikrotik::setHotspotUser($client, $username, $password);
+
+    if (empty($id)) {
+        return [
+            'verified' => false,
+            'error' => "Recharge saved but hotspot user [$username] did not reach router [$router_name] yet",
+        ];
+    }
+
+    try {
+        Mikrotik::setHotspotUser($client, $username, $password);
+    } catch (Throwable $e) {
+        return ['verified' => false, 'error' => $e->getMessage()];
+    }
+
     return ['verified' => true];
 }
 
@@ -1500,8 +1521,21 @@ function cvpap_act_active_recharges($q)
 
 /* ------------------------------------------------------- shared internals */
 
+function cvpap_router_probe_timeout_seconds()
+{
+    $raw = getenv('CVPAP_ROUTER_PROBE_TIMEOUT');
+    $timeout = is_numeric($raw) ? (int) $raw : 2;
+    if ($timeout < 1) {
+        $timeout = 1;
+    }
+    if ($timeout > 10) {
+        $timeout = 10;
+    }
+    return $timeout;
+}
+
 /**
- * Connectivity probe for one router: quick TCP check (5 s) before the
+ * Connectivity probe for one router: quick TCP check before the
  * RouterOS API login, so offline routers don't hang for the full socket
  * timeout.
  */
@@ -1520,7 +1554,7 @@ function cvpap_router_probe($name)
 
     $errno = 0;
     $errstr = '';
-    $sock = @fsockopen($host, $port, $errno, $errstr, 5);
+    $sock = @fsockopen($host, $port, $errno, $errstr, cvpap_router_probe_timeout_seconds());
     if ($sock === false) {
         return ['name' => $name, 'online' => false, 'error' => "tcp $host:$port unreachable: $errstr"];
     }

@@ -21,7 +21,27 @@ class Mikrotik
             return null;
         }
         $iport = explode(":", $ip);
-        return new RouterOS\Client($iport[0], $user, $pass, ($iport[1]) ? $iport[1] : null);
+        $host = $iport[0];
+        $port = (isset($iport[1]) && $iport[1] !== '') ? $iport[1] : null;
+
+        $rawTimeout = getenv('MIKROTIK_SOCKET_TIMEOUT');
+        $timeout = is_numeric($rawTimeout) ? (int) $rawTimeout : 5;
+        if ($timeout < 1) {
+            $timeout = 1;
+        }
+        if ($timeout > 20) {
+            $timeout = 20;
+        }
+
+        $previousTimeout = ini_get('default_socket_timeout');
+        @ini_set('default_socket_timeout', (string) $timeout);
+        try {
+            return new RouterOS\Client($host, $user, $pass, $port);
+        } finally {
+            if ($previousTimeout !== false && $previousTimeout !== null && $previousTimeout !== '') {
+                @ini_set('default_socket_timeout', (string) $previousTimeout);
+            }
+        }
     }
 
     public static function isUserLogin($client, $username)
