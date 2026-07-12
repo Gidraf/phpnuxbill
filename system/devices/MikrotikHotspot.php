@@ -74,10 +74,12 @@ class MikrotikHotspot
             $p = ORM::for_table("tbl_plans")->find_one($plan['plan_expired']);
             if($p){
                 $this->add_customer($customer, $p);
+                $this->removeHotspotCookie($client, $customer['username']);
                 $this->removeHotspotActiveUser($client, $customer['username']);
                 return;
             }
         }
+        $this->removeHotspotCookie($client, $customer['username']);
         $this->removeHotspotUser($client, $customer['username']);
         $this->removeHotspotActiveUser($client, $customer['username']);
     }
@@ -164,16 +166,8 @@ class MikrotikHotspot
     {
         $mikrotik = $this->info($router_name);
         $client = $this->getClient($mikrotik['ip_address'], $mikrotik['username'], $mikrotik['password']);
-        $printRequest = new RouterOS\Request(
-            '/ip hotspot active print',
-            RouterOS\Query::where('user', $customer['username'])
-        );
-        $id = $client->sendSync($printRequest)->getProperty('.id');
-        $removeRequest = new RouterOS\Request('/ip/hotspot/active/remove');
-        $client->sendSync(
-            $removeRequest
-                ->setArgument('numbers', $id)
-        );
+        $this->removeHotspotCookie($client, $customer['username']);
+        $this->removeHotspotActiveUser($client, $customer['username']);
     }
 
 
@@ -263,6 +257,9 @@ class MikrotikHotspot
             RouterOS\Query::where('name', $username)
         );
         $userID = $client->sendSync($printRequest)->getProperty('.id');
+        if (empty($userID)) {
+            return;
+        }
         $removeRequest = new RouterOS\Request('/ip/hotspot/user/remove');
         $client->sendSync(
             $removeRequest
@@ -381,11 +378,43 @@ class MikrotikHotspot
         $onlineRequest = new RouterOS\Request('/ip/hotspot/active/print');
         $onlineRequest->setArgument('.proplist', '.id');
         $onlineRequest->setQuery(RouterOS\Query::where('user', $username));
-        $id = $client->sendSync($onlineRequest)->getProperty('.id');
+        $responses = $client->sendSync($onlineRequest);
+        foreach ($responses as $response) {
+            if ($response->getType() !== RouterOS\Response::TYPE_DATA) {
+                continue;
+            }
+            $id = $response->getProperty('.id');
+            if (empty($id)) {
+                continue;
+            }
+            $removeRequest = new RouterOS\Request('/ip/hotspot/active/remove');
+            $removeRequest->setArgument('numbers', $id);
+            $client->sendSync($removeRequest);
+        }
+    }
 
-        $removeRequest = new RouterOS\Request('/ip/hotspot/active/remove');
-        $removeRequest->setArgument('numbers', $id);
-        $client->sendSync($removeRequest);
+    function removeHotspotCookie($client, $username)
+    {
+        global $_app_stage;
+        if ($_app_stage == 'Demo') {
+            return null;
+        }
+        $cookieRequest = new RouterOS\Request('/ip/hotspot/cookie/print');
+        $cookieRequest->setArgument('.proplist', '.id');
+        $cookieRequest->setQuery(RouterOS\Query::where('user', $username));
+        $responses = $client->sendSync($cookieRequest);
+        foreach ($responses as $response) {
+            if ($response->getType() !== RouterOS\Response::TYPE_DATA) {
+                continue;
+            }
+            $id = $response->getProperty('.id');
+            if (empty($id)) {
+                continue;
+            }
+            $removeRequest = new RouterOS\Request('/ip/hotspot/cookie/remove');
+            $removeRequest->setArgument('numbers', $id);
+            $client->sendSync($removeRequest);
+        }
     }
 
     function getIpHotspotUser($client, $username)

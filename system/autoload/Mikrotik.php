@@ -79,16 +79,37 @@ class Mikrotik
         if ($_app_stage == 'demo') {
             return null;
         }
-        $printRequest = new RouterOS\Request(
-            '/ip hotspot active print',
-            RouterOS\Query::where('user', $user)
-        );
-        $id = $client->sendSync($printRequest)->getProperty('.id');
-        $removeRequest = new RouterOS\Request('/ip/hotspot/active/remove');
-        $client->sendSync(
-            $removeRequest
-                ->setArgument('numbers', $id)
-        );
+        $printRequest = new RouterOS\Request('/ip/hotspot/active/print');
+        $printRequest->setArgument('.proplist', '.id');
+        $printRequest->setQuery(RouterOS\Query::where('user', $user));
+        foreach ($client->sendSync($printRequest) as $response) {
+            if ($response->getType() !== RouterOS\Response::TYPE_DATA) {
+                continue;
+            }
+            $id = $response->getProperty('.id');
+            if (empty($id)) {
+                continue;
+            }
+            $removeRequest = new RouterOS\Request('/ip/hotspot/active/remove');
+            $removeRequest->setArgument('numbers', $id);
+            $client->sendSync($removeRequest);
+        }
+
+        $cookieRequest = new RouterOS\Request('/ip/hotspot/cookie/print');
+        $cookieRequest->setArgument('.proplist', '.id');
+        $cookieRequest->setQuery(RouterOS\Query::where('user', $user));
+        foreach ($client->sendSync($cookieRequest) as $response) {
+            if ($response->getType() !== RouterOS\Response::TYPE_DATA) {
+                continue;
+            }
+            $id = $response->getProperty('.id');
+            if (empty($id)) {
+                continue;
+            }
+            $removeRequest = new RouterOS\Request('/ip/hotspot/cookie/remove');
+            $removeRequest->setArgument('numbers', $id);
+            $client->sendSync($removeRequest);
+        }
     }
 
     public static function addHotspotPlan($client, $name, $sharedusers, $rate)
@@ -192,6 +213,9 @@ class Mikrotik
             RouterOS\Query::where('name', $username)
         );
         $userID = $client->sendSync($printRequest)->getProperty('.id');
+        if (empty($userID)) {
+            return;
+        }
         $removeRequest = new RouterOS\Request('/ip/hotspot/user/remove');
         $client->sendSync(
             $removeRequest
