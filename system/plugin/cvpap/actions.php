@@ -1229,7 +1229,28 @@ function cvpap_act_recharge($q)
     if (!$inv) {
         throw new CvpapApiError('Recharge failed');
     }
-    cvpap_verify_hotspot_user($q['router'], $p, $c['username'], $c['password']);
+    // Billing is now committed — the customer HAS been recharged. Everything
+    // below touches the live router and must be best-effort: a router that is
+    // lagging or temporarily unreachable over the tunnel must NOT turn a
+    // completed recharge into an error (that made partners retry and
+    // double-charge, and surfaced as a 409 on the dashboard). We return the
+    // verify/auto-login state as metadata so the caller can heal it later.
+    $verify = ['verified' => false, 'skipped' => 'not attempted'];
+    try {
+        $verify = cvpap_verify_hotspot_user($q['router'], $p, $c['username'], $c['password']);
+    } catch (Throwable $e) {
+        $verify = ['verified' => false, 'error' => $e->getMessage()];
+    }
+    // If the recharge carried the paying device's MAC+IP, log it in server-side
+    // so a customer who paid but never opened the login form is connected
+    // automatically. Best-effort — creds still work if this can't run.
+    $login = ['ok' => false, 'skipped' => 'no mac/ip'];
+    try {
+        $login = cvpap_hotspot_autologin($q['router'], $p, $c['username'], $c['password'],
+            cvpap_param($q, 'mac', ''), cvpap_param($q, 'ip', ''));
+    } catch (Throwable $e) {
+        $login = ['ok' => false, 'error' => $e->getMessage()];
+    }
     $partner_uid = cvpap_partner_uid($q, false);
     if ($partner_uid != '') {
         cvpap_partner_customer_link(
@@ -1239,7 +1260,10 @@ function cvpap_act_recharge($q)
             $c['phonenumber']
         );
     }
-    return cvpap_recharge_result($c['username'], $q['router'], $p, $inv, $c['password']);
+    $res = cvpap_recharge_result($c['username'], $q['router'], $p, $inv, $c['password']);
+    $res['router_user_verified'] = $verify;
+    $res['auto_login'] = $login;
+    return $res;
 }
 
 /**
@@ -1366,6 +1390,44 @@ function cvpap_hotspot_autologin($router_name, $plan, $username, $password, $mac
     } catch (Throwable $e) {
         return ['ok' => false, 'error' => $e->getMessage()];
     }
+}
+
+/**
+ * Auto-heal primitive: connect a customer who already paid/recharged but never
+ * opened a session. No billing side-effects — it only logs the device in on the
+ * router by MAC+IP. Safe to call repeatedly (idempotent: logs out any stale
+ * session first). CVPAP's reconcile beat calls this for paid-but-offline
+ * purchases once the router is reachable again.
+ */
+function cvpap_act_hotspot_login($q)
+{
+    cvpap_require_params($q, ['router', 'plan_id']);
+    cvpap_assert_router_in_scope($q, $q['router']);
+    $p = cvpap_validate_plan_router($q['plan_id'], $q['router']);
+
+    $username = trim((string) cvpap_param($q, 'username', ''));
+    $password = (string) cvpap_param($q, 'password', '');
+    if ($username === '' && cvpap_param($q, 'customer_id', '') !== '') {
+        $c = ORM::for_table('tbl_customers')->find_one($q['customer_id']);
+        if ($c) {
+            $username = $c['username'];
+            $password = $c['password'];
+        }
+    }
+    if ($username === '' && cvpap_param($q, 'phone', '') !== '') {
+        $c = ORM::for_table('tbl_customers')->where('username', $q['phone'])->find_one();
+        if ($c) {
+            $username = $c['username'];
+            $password = $c['password'];
+        }
+    }
+    if ($username === '') {
+        throw new CvpapApiError('username, customer_id or phone is required');
+    }
+
+    $login = cvpap_hotspot_autologin($q['router'], $p, $username, $password,
+        cvpap_param($q, 'mac', ''), cvpap_param($q, 'ip', ''));
+    return ['username' => $username, 'auto_login' => $login];
 }
 
 /* -------------------------------------------------------------- vouchers */
