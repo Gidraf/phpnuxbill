@@ -186,6 +186,356 @@ function cvpap_act_disconnect_user($q)
 }
 
 /**
+ * Read-only helper: run a RouterOS API *print* and return every row as an assoc
+ * array (all properties). Never mutates — callers pass a print/monitor path.
+ */
+function cvpap_ros_rows($client, $apiPath, $proplist = null, $whereKey = null, $whereVal = null)
+{
+    $req = new PEAR2\Net\RouterOS\Request($apiPath);
+    if ($proplist !== null) {
+        $req->setArgument('.proplist', $proplist);
+    }
+    if ($whereKey !== null) {
+        $req->setQuery(PEAR2\Net\RouterOS\Query::where($whereKey, $whereVal));
+    }
+    $rows = [];
+    foreach ($client->sendSync($req) as $resp) {
+        if ($resp->getType() === PEAR2\Net\RouterOS\Response::TYPE_DATA) {
+            $props = [];
+            foreach ($resp->getIterator() as $k => $v) {
+                $props[$k] = is_scalar($v) ? $v : (string) $v;
+            }
+            $rows[] = $props;
+        }
+    }
+    return $rows;
+}
+
+/**
+ * Active hotspot sessions on a router, enriched per DEVICE: session id (.id),
+ * MAC, IP, uptime, data used, idle/keepalive, and the login method. Lets the
+ * dashboard act on a specific device/session (not just a username, which can
+ * span several devices). Also maps username -> customer so the UI shows an owner.
+ */
+function cvpap_act_active_sessions($q)
+{
+    cvpap_require_params($q, ['router']);
+    cvpap_assert_router_in_scope($q, $q['router']);
+    $router = Mikrotik::info($q['router']);
+    if (!$router) {
+        throw new CvpapApiError('Router not found');
+    }
+    $client = Mikrotik::getClient($router['ip_address'], $router['username'], $router['password']);
+    if ($client === null) {
+        return ['sessions' => [], 'demo' => true];
+    }
+    $rows = cvpap_ros_rows($client, '/ip/hotspot/active/print');
+    $sessions = [];
+    foreach ($rows as $r) {
+        $user = $r['user'] ?? '';
+        $owner = null;
+        if ($user !== '') {
+            $c = ORM::for_table('tbl_customers')->where('username', $user)->find_one();
+            if ($c) {
+                $owner = ['id' => $c['id'], 'fullname' => $c['fullname'], 'phone' => $c['phonenumber']];
+            }
+        }
+        $sessions[] = [
+            'session_id' => $r['.id'] ?? '',
+            'username' => $user,
+            'mac_address' => $r['mac-address'] ?? '',
+            'address' => $r['address'] ?? '',
+            'host_ip' => $r['host-ip'] ?? '',
+            'uptime' => $r['uptime'] ?? '',
+            'session_time_left' => $r['session-time-left'] ?? '',
+            'idle_time' => $r['idle-time'] ?? '',
+            'bytes_in' => (int) ($r['bytes-in'] ?? 0),
+            'bytes_out' => (int) ($r['bytes-out'] ?? 0),
+            'login_by' => $r['login-by'] ?? '',
+            'comment' => $r['comment'] ?? '',
+            'owner' => $owner,
+        ];
+    }
+    return ['router' => $q['router'], 'sessions' => $sessions];
+}
+
+/**
+ * Disconnect ONE device/session, not a whole username. Prefer the exact session
+ * id; fall back to MAC (find the active row for that MAC) then username. Safe to
+ * call on an already-gone session (no-op).
+ */
+function cvpap_act_session_disconnect($q)
+{
+    cvpap_require_params($q, ['router']);
+    cvpap_assert_router_in_scope($q, $q['router']);
+    $router = Mikrotik::info($q['router']);
+    if (!$router) {
+        throw new CvpapApiError('Router not found');
+    }
+    $client = Mikrotik::getClient($router['ip_address'], $router['username'], $router['password']);
+    if ($client === null) {
+        return ['disconnected' => false, 'demo' => true];
+    }
+
+    $sessionId = trim((string) cvpap_param($q, 'session_id', ''));
+    $mac = strtoupper(str_replace('-', ':', trim((string) cvpap_param($q, 'mac', ''))));
+    $username = trim((string) cvpap_param($q, 'username', ''));
+
+    // Resolve to a concrete active .id
+    if ($sessionId === '' && $mac !== '') {
+        $rows = cvpap_ros_rows($client, '/ip/hotspot/active/print', '.id', 'mac-address', $mac);
+        $sessionId = $rows[0]['.id'] ?? '';
+    }
+    if ($sessionId === '' && $username !== '') {
+        $rows = cvpap_ros_rows($client, '/ip/hotspot/active/print', '.id', 'user', $username);
+        $sessionId = $rows[0]['.id'] ?? '';
+    }
+    if ($sessionId === '') {
+        return ['disconnected' => false, 'reason' => 'no matching active session'];
+    }
+    $rm = new PEAR2\Net\RouterOS\Request('/ip/hotspot/active/remove');
+    $rm->setArgument('numbers', $sessionId);
+    $client->sendSync($rm);
+    return ['disconnected' => true, 'session_id' => $sessionId, 'router' => $q['router']];
+}
+
+/**
+ * Reconnect ONE device by MAC (+IP): log the exact device out then back in
+ * server-side, so a paid device stuck on a stale/dead session is refreshed onto
+ * its current plan without the customer touching anything. No plan_id needed —
+ * it reuses the customer's existing hotspot creds. If mac/ip aren't supplied it
+ * discovers them from the device's current active session by username.
+ */
+function cvpap_act_session_reconnect($q)
+{
+    cvpap_require_params($q, ['router']);
+    cvpap_assert_router_in_scope($q, $q['router']);
+    $router = Mikrotik::info($q['router']);
+    if (!$router) {
+        throw new CvpapApiError('Router not found');
+    }
+    $client = Mikrotik::getClient($router['ip_address'], $router['username'], $router['password']);
+    if ($client === null) {
+        return ['reconnected' => false, 'demo' => true];
+    }
+
+    $mac = strtoupper(str_replace('-', ':', trim((string) cvpap_param($q, 'mac', ''))));
+    $ip = trim((string) cvpap_param($q, 'ip', ''));
+    $username = trim((string) cvpap_param($q, 'username', ''));
+    $password = '';
+
+    if ($username === '' && cvpap_param($q, 'customer_id', '') !== '') {
+        $c = ORM::for_table('tbl_customers')->find_one($q['customer_id']);
+        if ($c) { $username = $c['username']; $password = $c['password']; }
+    }
+    if ($username !== '' && $password === '') {
+        $c = ORM::for_table('tbl_customers')->where('username', $username)->find_one();
+        if ($c) { $password = $c['password']; }
+    }
+    if ($username === '') {
+        throw new CvpapApiError('username or customer_id is required');
+    }
+
+    // Fill in the device's mac/ip from its live session if the caller didn't.
+    if ($mac === '' || $ip === '') {
+        $rows = cvpap_ros_rows($client, '/ip/hotspot/active/print', '.id,user,address,mac-address', 'user', $username);
+        if (!empty($rows)) {
+            if ($mac === '') { $mac = strtoupper((string) ($rows[0]['mac-address'] ?? '')); }
+            if ($ip === '')  { $ip = (string) ($rows[0]['address'] ?? ''); }
+        }
+    }
+    if (!preg_match('/^([0-9A-F]{2}:){5}[0-9A-F]{2}$/', $mac) || $ip === '') {
+        return ['reconnected' => false, 'reason' => 'need device mac+ip (device not currently visible on the router)'];
+    }
+
+    try { Mikrotik::logMeOut($client, $username); } catch (Throwable $e) {}
+    Mikrotik::logMeIn($client, $username, $password, $ip, $mac);
+    return ['reconnected' => true, 'username' => $username, 'mac' => $mac, 'ip' => $ip, 'router' => $q['router']];
+}
+
+// Read-only commands the dashboard is allowed to run against a router. Every one
+// is a `print` (or resource read) — no add/set/remove/enable/import can ever run
+// through this path, so a compromised dashboard call still cannot change a router.
+const CVPAP_SAFE_COMMANDS = [
+    '/system/resource/print'          => 'Router CPU/RAM/uptime/version',
+    '/system/identity/print'          => 'Router name',
+    '/ip/hotspot/active/print'        => 'Active hotspot sessions',
+    '/ip/hotspot/host/print'          => 'Devices seen by the hotspot',
+    '/ip/hotspot/user/print'          => 'Hotspot user accounts',
+    '/ip/firewall/nat/print'          => 'NAT rules (masquerade etc.)',
+    '/ip/firewall/filter/print'       => 'Firewall filter rules',
+    '/ip/dns/print'                   => 'DNS settings',
+    '/ip/address/print'               => 'Interface IP addresses / subnets',
+    '/ip/route/print'                 => 'Routing table (default route)',
+    '/ip/dhcp-server/lease/print'     => 'DHCP leases',
+    '/interface/print'                => 'Interfaces',
+    '/interface/wireguard/peers/print' => 'WireGuard tunnel peers (handshakes)',
+    '/queue/simple/print'             => 'Bandwidth queues',
+    '/log/print'                      => 'Recent router log',
+];
+
+/**
+ * Normalise a command the dashboard sent (CLI-style "/ip hotspot active print"
+ * or API-style "/ip/hotspot/active/print") to an API path, and reject anything
+ * not on the read-only allowlist.
+ */
+function cvpap_normalise_command($command)
+{
+    $c = trim((string) $command);
+    if ($c === '') {
+        return '';
+    }
+    // collapse whitespace, turn CLI spaces into API slashes
+    $c = preg_replace('/\s+/', '/', $c);
+    $c = '/' . trim(str_replace('//', '/', $c), '/');
+    return $c;
+}
+
+function cvpap_act_run_command($q)
+{
+    cvpap_require_params($q, ['router', 'command']);
+    cvpap_assert_router_in_scope($q, $q['router']);
+    $path = cvpap_normalise_command($q['command']);
+    if (!array_key_exists($path, CVPAP_SAFE_COMMANDS)) {
+        throw new CvpapApiError('Command not allowed. Only read-only print commands are permitted.');
+    }
+    $router = Mikrotik::info($q['router']);
+    if (!$router) {
+        throw new CvpapApiError('Router not found');
+    }
+    $client = Mikrotik::getClient($router['ip_address'], $router['username'], $router['password']);
+    if ($client === null) {
+        return ['command' => $path, 'rows' => [], 'demo' => true];
+    }
+    $proplist = null;
+    if ($path === '/log/print') {
+        $proplist = 'time,topics,message';
+    }
+    $rows = cvpap_ros_rows($client, $path, $proplist);
+    if ($path === '/log/print') {
+        $limit = (int) cvpap_param($q, 'limit', 60);
+        if ($limit > 0 && count($rows) > $limit) {
+            $rows = array_slice($rows, -$limit);
+        }
+    }
+    return ['command' => $path, 'label' => CVPAP_SAFE_COMMANDS[$path], 'count' => count($rows), 'rows' => $rows];
+}
+
+/**
+ * One-shot health read of a router that INTERPRETS itself: it runs the key
+ * read-only checks (tunnel handshake, hotspot up, NAT present, DNS answering
+ * clients, default route, active sessions) and returns a verdict + plain-English
+ * findings + suggested fixes, so the dashboard can say "what's going on" without
+ * a human reading raw RouterOS output.
+ */
+function cvpap_act_diagnostics($q)
+{
+    cvpap_require_params($q, ['router']);
+    cvpap_assert_router_in_scope($q, $q['router']);
+    $router = Mikrotik::info($q['router']);
+    if (!$router) {
+        throw new CvpapApiError('Router not found');
+    }
+    $client = Mikrotik::getClient($router['ip_address'], $router['username'], $router['password']);
+    if ($client === null) {
+        return ['checks' => [], 'demo' => true];
+    }
+
+    $checks = [];
+    $add = function ($id, $label, $ok, $detail, $fix = null) use (&$checks) {
+        $checks[] = ['id' => $id, 'label' => $label, 'ok' => (bool) $ok, 'detail' => $detail, 'fix' => $fix];
+    };
+
+    // 1. Tunnel: is there a WireGuard peer with a recent handshake?
+    try {
+        $peers = cvpap_ros_rows($client, '/interface/wireguard/peers/print');
+        $hs = '';
+        foreach ($peers as $p) {
+            if (!empty($p['last-handshake'])) { $hs = $p['last-handshake']; break; }
+        }
+        $add('tunnel', 'Management tunnel', $hs !== '',
+            $hs !== '' ? "Last handshake $hs ago" : 'No recent WireGuard handshake',
+            $hs !== '' ? null : 'Check the router\'s internet line; the tunnel reconnects on its own.');
+    } catch (Throwable $e) {
+        $add('tunnel', 'Management tunnel', false, 'Could not read peers: ' . $e->getMessage());
+    }
+
+    // 2. Hotspot server present & enabled
+    try {
+        $hs = cvpap_ros_rows($client, '/ip/hotspot/print');
+        $enabled = false;
+        foreach ($hs as $h) {
+            if (($h['disabled'] ?? 'true') === 'false' || ($h['disabled'] ?? '') === 'no') { $enabled = true; }
+        }
+        $add('hotspot', 'Hotspot server', count($hs) > 0 && $enabled,
+            count($hs) === 0 ? 'No hotspot configured' : ($enabled ? 'Hotspot is running' : 'Hotspot exists but is disabled'),
+            count($hs) > 0 && $enabled ? null : 'Re-import the setup config from the dashboard.');
+    } catch (Throwable $e) {
+        $add('hotspot', 'Hotspot server', false, $e->getMessage());
+    }
+
+    // 3. NAT masquerade present (clients can reach the internet)
+    try {
+        $nat = cvpap_ros_rows($client, '/ip/firewall/nat/print');
+        $hasMasq = false;
+        foreach ($nat as $n) {
+            if (($n['action'] ?? '') === 'masquerade' && ($n['disabled'] ?? 'true') !== 'true') { $hasMasq = true; break; }
+        }
+        $add('nat', 'Internet NAT (masquerade)', $hasMasq,
+            $hasMasq ? 'Masquerade rule active' : 'No active masquerade rule — clients get no internet',
+            $hasMasq ? null : 'Troubleshooting → "connected, no internet" has the one-line fix.');
+    } catch (Throwable $e) {
+        $add('nat', 'Internet NAT (masquerade)', false, $e->getMessage());
+    }
+
+    // 4. DNS answering clients
+    try {
+        $dns = cvpap_ros_rows($client, '/ip/dns/print');
+        $remote = false; $servers = '';
+        foreach ($dns as $d) {
+            $servers = $d['servers'] ?? '';
+            if (($d['allow-remote-requests'] ?? '') === 'true' || ($d['allow-remote-requests'] ?? '') === 'yes') { $remote = true; }
+        }
+        $add('dns', 'DNS for clients', $remote && $servers !== '',
+            $remote ? "Serving DNS ($servers)" : 'DNS not answering clients (allow-remote-requests off)',
+            $remote ? null : '/ip dns set servers=8.8.8.8,1.1.1.1 allow-remote-requests=yes');
+    } catch (Throwable $e) {
+        $add('dns', 'DNS for clients', false, $e->getMessage());
+    }
+
+    // 5. Default route present
+    try {
+        $routes = cvpap_ros_rows($client, '/ip/route/print', '.id,dst-address,gateway,active', 'dst-address', '0.0.0.0/0');
+        $active = false; $gw = '';
+        foreach ($routes as $r) {
+            if (($r['active'] ?? '') === 'true' || ($r['active'] ?? '') === 'yes') { $active = true; $gw = $r['gateway'] ?? ''; }
+        }
+        $add('route', 'Internet route', $active,
+            $active ? "Default route via $gw" : 'No active default route — the router itself has no internet',
+            $active ? null : 'Check the WAN cable/PPPoE on ether1.');
+    } catch (Throwable $e) {
+        $add('route', 'Internet route', false, $e->getMessage());
+    }
+
+    // 6. Active sessions count (informational)
+    try {
+        $active = cvpap_ros_rows($client, '/ip/hotspot/active/print', '.id');
+        $add('sessions', 'Active devices', true, count($active) . ' device(s) online now');
+    } catch (Throwable $e) {
+        $add('sessions', 'Active devices', false, $e->getMessage());
+    }
+
+    $failed = array_values(array_filter($checks, function ($c) { return !$c['ok']; }));
+    $verdict = count($failed) === 0 ? 'healthy' : (count($failed) >= 3 ? 'critical' : 'degraded');
+    if (count($failed) === 0) {
+        $summary = 'All checks passed — the router is set up correctly and online.';
+    } else {
+        $summary = count($failed) . ' issue(s) found: ' . implode('; ', array_map(function ($c) { return $c['label'] . ' — ' . $c['detail']; }, $failed));
+    }
+    return ['router' => $q['router'], 'verdict' => $verdict, 'summary' => $summary, 'checks' => $checks, 'failed' => count($failed)];
+}
+
+/**
  * Tunnel health check: can nuxbill actually reach a MikroTik at ip:port with
  * the given API creds? Used during onboarding so we only register a router
  * once its tunnel really works (a dead tunnel = paid-but-no-access later).
