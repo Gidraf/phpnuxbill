@@ -1251,6 +1251,26 @@ function cvpap_act_recharge($q)
     } catch (Throwable $e) {
         $login = ['ok' => false, 'error' => $e->getMessage()];
     }
+    // If we could NOT seamlessly re-login the device (no MAC/IP on a dashboard
+    // recharge, or the login failed), the phone may still be holding its OLD
+    // hotspot session. After a plan change that session is dead: the device shows
+    // "connected" with full bars (the OS captive check still succeeds) but carries
+    // no traffic. Drop any lingering session so the device re-authenticates onto
+    // the freshly-recharged plan. Best-effort — never fail a committed recharge.
+    if (empty($login['ok'])) {
+        try {
+            $router = Mikrotik::info($q['router']);
+            if ($router) {
+                $client = Mikrotik::getClient($router['ip_address'], $router['username'], $router['password']);
+                if ($client !== null) {
+                    Mikrotik::removeHotspotActiveUser($client, $c['username']);
+                    $login['session_reset'] = true;
+                }
+            }
+        } catch (Throwable $e) {
+            $login['session_reset_error'] = $e->getMessage();
+        }
+    }
     $partner_uid = cvpap_partner_uid($q, false);
     if ($partner_uid != '') {
         cvpap_partner_customer_link(

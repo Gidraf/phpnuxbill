@@ -336,6 +336,11 @@ class Mikrotik
         $onlineRequest->setQuery(RouterOS\Query::where('user', $username));
         $id = $client->sendSync($onlineRequest)->getProperty('.id');
 
+        // No active session for this user — nothing to remove. Guard against
+        // sending an empty `numbers=` (RouterOS errors on it).
+        if (empty($id)) {
+            return null;
+        }
         $removeRequest = new RouterOS\Request('/ip/hotspot/active/remove');
         $removeRequest->setArgument('numbers', $id);
         $client->sendSync($removeRequest);
