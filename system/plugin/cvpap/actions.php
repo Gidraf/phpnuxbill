@@ -536,6 +536,77 @@ function cvpap_act_diagnostics($q)
 }
 
 /**
+ * Apply ONE known-safe remediation, keyed by a diagnostic check id. This is the
+ * ONLY write path the dashboard can trigger, and it is a fixed allowlist — each
+ * fix is a specific, idempotent operation, never a free-form command:
+ *   nat     -> (re)create the subnet-agnostic masquerade rule
+ *   dns     -> set 8.8.8.8/1.1.1.1 + allow-remote-requests
+ *   hotspot -> enable an existing-but-disabled hotspot server
+ * After applying it re-runs diagnostics so the caller sees the fresh state.
+ */
+function cvpap_act_apply_fix($q)
+{
+    cvpap_require_params($q, ['router', 'fix']);
+    cvpap_assert_router_in_scope($q, $q['router']);
+    $fix = preg_replace('/[^a-z0-9_]/', '', strtolower((string) $q['fix']));
+    if (!in_array($fix, ['nat', 'dns', 'hotspot'], true)) {
+        throw new CvpapApiError('Unknown fix — only nat, dns, hotspot are supported.');
+    }
+    $router = Mikrotik::info($q['router']);
+    if (!$router) {
+        throw new CvpapApiError('Router not found');
+    }
+    $client = Mikrotik::getClient($router['ip_address'], $router['username'], $router['password']);
+    if ($client === null) {
+        return ['applied' => false, 'demo' => true];
+    }
+
+    $tunnelNet = preg_replace('/[^0-9.]/', '', (string) cvpap_param($q, 'tunnel_net', '10.99.0'));
+    if ($tunnelNet === '') { $tunnelNet = '10.99.0'; }
+    $applied = [];
+
+    if ($fix === 'nat') {
+        foreach (cvpap_ros_rows($client, '/ip/firewall/nat/print', '.id', 'comment', 'cvpap-hs-nat') as $r) {
+            $rm = new PEAR2\Net\RouterOS\Request('/ip/firewall/nat/remove');
+            $rm->setArgument('numbers', $r['.id']);
+            $client->sendSync($rm);
+        }
+        $add = new PEAR2\Net\RouterOS\Request('/ip/firewall/nat/add');
+        $add->setArgument('chain', 'srcnat');
+        $add->setArgument('action', 'masquerade');
+        $add->setArgument('dst-address', '!' . $tunnelNet . '.0/24');
+        $add->setArgument('comment', 'cvpap-hs-nat');
+        $client->sendSync($add);
+        $applied[] = 'Added masquerade NAT (dst-address=!' . $tunnelNet . '.0/24)';
+    } elseif ($fix === 'dns') {
+        $set = new PEAR2\Net\RouterOS\Request('/ip/dns/set');
+        $set->setArgument('servers', '8.8.8.8,1.1.1.1');
+        $set->setArgument('allow-remote-requests', 'yes');
+        $client->sendSync($set);
+        $applied[] = 'Set DNS 8.8.8.8,1.1.1.1 + allow-remote-requests=yes';
+    } elseif ($fix === 'hotspot') {
+        $rows = cvpap_ros_rows($client, '/ip/hotspot/print', '.id,disabled,name');
+        if (count($rows) === 0) {
+            return ['applied' => false, 'fix' => $fix,
+                'reason' => 'No hotspot exists to enable — re-import the setup config from the dashboard.'];
+        }
+        $enabled = 0;
+        foreach ($rows as $r) {
+            if (($r['disabled'] ?? '') === 'true' || ($r['disabled'] ?? '') === 'yes') {
+                $en = new PEAR2\Net\RouterOS\Request('/ip/hotspot/enable');
+                $en->setArgument('numbers', $r['.id']);
+                $client->sendSync($en);
+                $enabled++;
+            }
+        }
+        $applied[] = $enabled > 0 ? "Enabled $enabled hotspot server(s)" : 'Hotspot was already enabled';
+    }
+
+    $verify = cvpap_act_diagnostics($q);
+    return ['applied' => true, 'fix' => $fix, 'actions' => $applied, 'diagnostics' => $verify];
+}
+
+/**
  * Tunnel health check: can nuxbill actually reach a MikroTik at ip:port with
  * the given API creds? Used during onboarding so we only register a router
  * once its tunnel really works (a dead tunnel = paid-but-no-access later).
