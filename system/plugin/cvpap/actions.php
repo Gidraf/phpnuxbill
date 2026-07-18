@@ -376,6 +376,7 @@ const CVPAP_SAFE_COMMANDS = [
     '/ip/hotspot/walled-garden/print' => 'Walled-garden (HTTP) — pay-page access',
     '/ip/hotspot/walled-garden/ip/print' => 'Walled-garden IP (HTTPS) — pay-page access',
     '/ip/hotspot/print'               => 'Hotspot servers',
+    '/ip/hotspot/profile/print'       => 'Hotspot profiles (html-directory)',
 ];
 
 /**
@@ -548,16 +549,31 @@ function cvpap_act_diagnostics($q)
     // server problem but is purely a missing local file.
     try {
         $files = cvpap_ros_rows($client, '/file/print', '.id,name,size');
-        $login = null;
+        $fileNames = [];
         foreach ($files as $f) {
-            if (strpos((string) ($f['name'] ?? ''), 'login.html') !== false) { $login = $f; break; }
+            $fileNames[(string) ($f['name'] ?? '')] = (int) ($f['size'] ?? 0);
         }
-        $size = (int) ($login['size'] ?? 0);
-        $ok = $login !== null && $size > 0;
+        // Which directory does the hotspot actually SERVE from? A profile whose
+        // html-directory has a typo (e.g. "hotsport") points at an empty folder,
+        // so login.html exists on disk but the portal still dies with "the web
+        // page couldn't be loaded". Verify the served directory, not just the file.
+        $dirs = [];
+        foreach (cvpap_ros_rows($client, '/ip/hotspot/profile/print', '.id,name,html-directory') as $p) {
+            $d = trim((string) ($p['html-directory'] ?? ''));
+            if ($d !== '') { $dirs[$d] = (string) ($p['name'] ?? ''); }
+        }
+        if (empty($dirs)) { $dirs = ['hotspot' => 'default']; }
+        $bad = [];
+        $good = [];
+        foreach ($dirs as $dir => $profile) {
+            $path = rtrim($dir, '/') . '/login.html';
+            if (!empty($fileNames[$path])) { $good[] = "$path (" . $fileNames[$path] . " bytes)"; }
+            else { $bad[] = "profile [$profile] serves from \"$dir\" but $path is missing"; }
+        }
+        $ok = count($bad) === 0;
         $add('loginpage', 'Login page installed', $ok,
-            $login === null ? 'hotspot/login.html is missing from the router'
-                : ($size > 0 ? "hotspot/login.html present ($size bytes)" : 'hotspot/login.html is empty (0 bytes)'),
-            $ok ? null : 'Dashboard → Advanced → "Install portal page" pushes it to the router.');
+            $ok ? 'Serving ' . implode(', ', $good) : implode('; ', $bad),
+            $ok ? null : 'Point the profile at the right folder: /ip hotspot profile set [find] html-directory=hotspot — then Advanced → "Install portal page".');
     } catch (Throwable $e) {
         $add('loginpage', 'Login page installed', false, $e->getMessage());
     }
@@ -594,8 +610,8 @@ function cvpap_act_apply_fix($q)
     cvpap_require_params($q, ['router', 'fix']);
     cvpap_assert_router_in_scope($q, $q['router']);
     $fix = preg_replace('/[^a-z0-9_]/', '', strtolower((string) $q['fix']));
-    if (!in_array($fix, ['nat', 'dns', 'hotspot', 'portal'], true)) {
-        throw new CvpapApiError('Unknown fix — only nat, dns, hotspot, portal are supported.');
+    if (!in_array($fix, ['nat', 'dns', 'hotspot', 'portal', 'loginpage'], true)) {
+        throw new CvpapApiError('Unknown fix — only nat, dns, hotspot, portal, loginpage are supported.');
     }
     $router = Mikrotik::info($q['router']);
     if (!$router) {
@@ -667,6 +683,35 @@ function cvpap_act_apply_fix($q)
         $a2->setArgument('comment', 'cvpap-portal-ip');
         $client->sendSync($a2);
         $applied[] = "Whitelisted pay-page $host for HTTP + HTTPS before login";
+    } elseif ($fix === 'loginpage') {
+        // Point every hotspot profile at the directory that ACTUALLY holds
+        // login.html. Catches the classic typo'd html-directory (e.g. "hotsport"),
+        // where the file exists but the hotspot serves an empty folder.
+        $dir = '';
+        foreach (cvpap_ros_rows($client, '/file/print', '.id,name,size') as $f) {
+            $n = (string) ($f['name'] ?? '');
+            if (substr($n, -11) === '/login.html' && (int) ($f['size'] ?? 0) > 0) {
+                $dir = substr($n, 0, strlen($n) - 11);
+                break;
+            }
+        }
+        if ($dir === '') {
+            return ['applied' => false, 'fix' => $fix,
+                'reason' => 'No login.html found on the router — use Advanced → "Install portal page" first, then run this fix.'];
+        }
+        $changed = 0;
+        foreach (cvpap_ros_rows($client, '/ip/hotspot/profile/print', '.id,name,html-directory') as $p) {
+            if (trim((string) ($p['html-directory'] ?? '')) !== $dir) {
+                $st = new PEAR2\Net\RouterOS\Request('/ip/hotspot/profile/set');
+                $st->setArgument('numbers', $p['.id']);
+                $st->setArgument('html-directory', $dir);
+                $client->sendSync($st);
+                $changed++;
+            }
+        }
+        $applied[] = $changed > 0
+            ? "Pointed $changed hotspot profile(s) at \"$dir\" (where login.html actually lives)"
+            : "Profiles already serve from \"$dir\"";
     }
 
     // NOTE: deliberately does NOT re-run diagnostics here. Doing the write plus a
