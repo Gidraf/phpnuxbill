@@ -517,7 +517,27 @@ function cvpap_act_diagnostics($q)
         $add('route', 'Internet route', false, $e->getMessage());
     }
 
-    // 6. Active sessions count (informational)
+    // 6. Portal reachable by an UNAUTHENTICATED device. The HTTPS pay-page only
+    // gets through if the IP-level walled-garden entry exists — the HTTP-level
+    // one alone silently drops TLS (blank page on Android, "unable to connect"
+    // on macOS), which looks like a broken portal rather than a firewall rule.
+    try {
+        $wgIp = cvpap_ros_rows($client, '/ip/hotspot/walled-garden/ip/print');
+        $okIp = false;
+        foreach ($wgIp as $w) {
+            if (($w['disabled'] ?? '') !== 'true'
+                && (($w['comment'] ?? '') === 'cvpap-portal-ip' || !empty($w['dst-host']))) {
+                $okIp = true; break;
+            }
+        }
+        $add('portal', 'Pay-page reachable', $okIp,
+            $okIp ? 'Portal is whitelisted for HTTPS before login' : 'Portal not reachable before login — the login page will be blank',
+            $okIp ? null : '/ip hotspot walled-garden ip add dst-host=<portal-host> action=accept comment="cvpap-portal-ip"');
+    } catch (Throwable $e) {
+        $add('portal', 'Pay-page reachable', false, $e->getMessage());
+    }
+
+    // 7. Active sessions count (informational)
     try {
         $active = cvpap_ros_rows($client, '/ip/hotspot/active/print', '.id');
         $add('sessions', 'Active devices', true, count($active) . ' device(s) online now');
@@ -549,8 +569,8 @@ function cvpap_act_apply_fix($q)
     cvpap_require_params($q, ['router', 'fix']);
     cvpap_assert_router_in_scope($q, $q['router']);
     $fix = preg_replace('/[^a-z0-9_]/', '', strtolower((string) $q['fix']));
-    if (!in_array($fix, ['nat', 'dns', 'hotspot'], true)) {
-        throw new CvpapApiError('Unknown fix — only nat, dns, hotspot are supported.');
+    if (!in_array($fix, ['nat', 'dns', 'hotspot', 'portal'], true)) {
+        throw new CvpapApiError('Unknown fix — only nat, dns, hotspot, portal are supported.');
     }
     $router = Mikrotik::info($q['router']);
     if (!$router) {
@@ -600,10 +620,36 @@ function cvpap_act_apply_fix($q)
             }
         }
         $applied[] = $enabled > 0 ? "Enabled $enabled hotspot server(s)" : 'Hotspot was already enabled';
+    } elseif ($fix === 'portal') {
+        $host = trim((string) cvpap_param($q, 'portal_host', ''));
+        if ($host === '') {
+            throw new CvpapApiError('portal_host is required to whitelist the pay-page');
+        }
+        foreach (['walled-garden' => 'cvpap-portal', 'walled-garden/ip' => 'cvpap-portal-ip'] as $sub => $comment) {
+            foreach (cvpap_ros_rows($client, "/ip/hotspot/$sub/print", '.id', 'comment', $comment) as $r) {
+                $rm = new PEAR2\Net\RouterOS\Request("/ip/hotspot/$sub/remove");
+                $rm->setArgument('numbers', $r['.id']);
+                $client->sendSync($rm);
+            }
+        }
+        $a1 = new PEAR2\Net\RouterOS\Request('/ip/hotspot/walled-garden/add');
+        $a1->setArgument('dst-host', $host);
+        $a1->setArgument('comment', 'cvpap-portal');
+        $client->sendSync($a1);
+        $a2 = new PEAR2\Net\RouterOS\Request('/ip/hotspot/walled-garden/ip/add');
+        $a2->setArgument('dst-host', $host);
+        $a2->setArgument('action', 'accept');
+        $a2->setArgument('comment', 'cvpap-portal-ip');
+        $client->sendSync($a2);
+        $applied[] = "Whitelisted pay-page $host for HTTP + HTTPS before login";
     }
 
-    $verify = cvpap_act_diagnostics($q);
-    return ['applied' => true, 'fix' => $fix, 'actions' => $applied, 'diagnostics' => $verify];
+    // NOTE: deliberately does NOT re-run diagnostics here. Doing the write plus a
+    // full 6-check re-diagnose in one call doubled the RouterOS round-trips over
+    // the tunnel and blew the client timeout ("NuxBill service is unreachable"),
+    // even though the write itself had already succeeded. The dashboard refetches
+    // diagnostics right after this returns, so the fresh state still shows up.
+    return ['applied' => true, 'fix' => $fix, 'actions' => $applied];
 }
 
 /**
