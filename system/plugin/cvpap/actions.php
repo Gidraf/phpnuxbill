@@ -372,6 +372,10 @@ const CVPAP_SAFE_COMMANDS = [
     '/interface/wireguard/peers/print' => 'WireGuard tunnel peers (handshakes)',
     '/queue/simple/print'             => 'Bandwidth queues',
     '/log/print'                      => 'Recent router log',
+    '/file/print'                     => 'Files on the router (login.html etc.)',
+    '/ip/hotspot/walled-garden/print' => 'Walled-garden (HTTP) — pay-page access',
+    '/ip/hotspot/walled-garden/ip/print' => 'Walled-garden IP (HTTPS) — pay-page access',
+    '/ip/hotspot/print'               => 'Hotspot servers',
 ];
 
 /**
@@ -537,7 +541,28 @@ function cvpap_act_diagnostics($q)
         $add('portal', 'Pay-page reachable', false, $e->getMessage());
     }
 
-    // 7. Active sessions count (informational)
+    // 7. The login page actually exists on the router. The .rsc fetches
+    // hotspot/login.html during import behind a retry loop; if every attempt
+    // failed the hotspot has no page to serve and the captive portal dies with
+    // "the web page couldn't be loaded" / a blank window — which looks like a
+    // server problem but is purely a missing local file.
+    try {
+        $files = cvpap_ros_rows($client, '/file/print', '.id,name,size');
+        $login = null;
+        foreach ($files as $f) {
+            if (strpos((string) ($f['name'] ?? ''), 'login.html') !== false) { $login = $f; break; }
+        }
+        $size = (int) ($login['size'] ?? 0);
+        $ok = $login !== null && $size > 0;
+        $add('loginpage', 'Login page installed', $ok,
+            $login === null ? 'hotspot/login.html is missing from the router'
+                : ($size > 0 ? "hotspot/login.html present ($size bytes)" : 'hotspot/login.html is empty (0 bytes)'),
+            $ok ? null : 'Dashboard → Advanced → "Install portal page" pushes it to the router.');
+    } catch (Throwable $e) {
+        $add('loginpage', 'Login page installed', false, $e->getMessage());
+    }
+
+    // 8. Active sessions count (informational)
     try {
         $active = cvpap_ros_rows($client, '/ip/hotspot/active/print', '.id');
         $add('sessions', 'Active devices', true, count($active) . ' device(s) online now');
