@@ -578,7 +578,44 @@ function cvpap_act_diagnostics($q)
         $add('loginpage', 'Login page installed', false, $e->getMessage());
     }
 
-    // 8. Active sessions count (informational)
+    // 8. Can the billing server actually WRITE to this router? If the API user is
+    // read-only, every read here succeeds while every one-click fix fails with a
+    // confusing error — so name it explicitly rather than letting fixes die.
+    try {
+        $me = trim((string) $router['username']);
+        $grp = '';
+        foreach (cvpap_ros_rows($client, '/user/print', '.id,name,group') as $u) {
+            if ((string) ($u['name'] ?? '') === $me) { $grp = (string) ($u['group'] ?? ''); break; }
+        }
+        $policies = '';
+        if ($grp !== '') {
+            foreach (cvpap_ros_rows($client, '/user/group/print', '.id,name,policy') as $g) {
+                if ((string) ($g['name'] ?? '') === $grp) { $policies = (string) ($g['policy'] ?? ''); break; }
+            }
+        }
+        // Only FAIL when we can positively prove write is missing. Reading /user
+        // needs the `policy` privilege, which the hardened cvpap-api user is not
+        // granted on purpose — so "couldn't read it" is normal, NOT a fault, and
+        // must not raise a false alarm on a correctly-locked-down router.
+        if ($grp === '') {
+            $add('permissions', 'Router API permissions', true,
+                "Not verifiable (the API user cannot list accounts — normal on a locked-down router)");
+        } else {
+            $canWrite = in_array($grp, ['full', 'write'], true) || strpos($policies, 'write') !== false;
+            $add('permissions', 'Router API permissions', $canWrite,
+                $canWrite ? "User [$me] in group [$grp] can apply fixes"
+                    : "User [$me] in group [$grp] is read-only — one-click fixes will fail",
+                $canWrite ? null
+                    : '/user group set [find name=' . $grp . '] policy=api,read,write,test,winbox,rest-api');
+        }
+    } catch (Throwable $e) {
+        // Reading /user requires the `policy` privilege we intentionally withhold,
+        // so this is expected on hardened routers — report it, don't fail on it.
+        $add('permissions', 'Router API permissions', true,
+            'Not verifiable (the API user cannot list accounts — normal on a locked-down router)');
+    }
+
+    // 9. Active sessions count (informational)
     try {
         $active = cvpap_ros_rows($client, '/ip/hotspot/active/print', '.id');
         $add('sessions', 'Active devices', true, count($active) . ' device(s) online now');
@@ -625,6 +662,11 @@ function cvpap_act_apply_fix($q)
     $tunnelNet = preg_replace('/[^0-9.]/', '', (string) cvpap_param($q, 'tunnel_net', '10.99.0'));
     if ($tunnelNet === '') { $tunnelNet = '10.99.0'; }
     $applied = [];
+
+    // Everything below WRITES to the router. A read-only API user makes these fail
+    // with an opaque RouterOS error, so translate that into something actionable
+    // instead of leaking "not enough permissions (9)" to a shop owner.
+    try {
 
     if ($fix === 'nat') {
         foreach (cvpap_ros_rows($client, '/ip/firewall/nat/print', '.id', 'comment', 'cvpap-hs-nat') as $r) {
@@ -712,6 +754,17 @@ function cvpap_act_apply_fix($q)
         $applied[] = $changed > 0
             ? "Pointed $changed hotspot profile(s) at \"$dir\" (where login.html actually lives)"
             : "Profiles already serve from \"$dir\"";
+    }
+    } catch (Throwable $e) {
+        $msg = $e->getMessage();
+        if (stripos($msg, 'permission') !== false || stripos($msg, 'not enough') !== false
+            || stripos($msg, 'denied') !== false) {
+            throw new CvpapApiError(
+                'The router refused the change: the billing API user does not have write permission. '
+                . 'On the router run: /user group set [find name=cvpap-api] '
+                . 'policy=api,read,write,test,winbox,rest-api  (original error: ' . $msg . ')');
+        }
+        throw new CvpapApiError('Could not apply the fix on the router: ' . $msg);
     }
 
     // NOTE: deliberately does NOT re-run diagnostics here. Doing the write plus a
