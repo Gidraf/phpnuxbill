@@ -377,6 +377,7 @@ const CVPAP_SAFE_COMMANDS = [
     '/ip/hotspot/walled-garden/ip/print' => 'Walled-garden IP (HTTPS) — pay-page access',
     '/ip/hotspot/print'               => 'Hotspot servers',
     '/ip/hotspot/profile/print'       => 'Hotspot profiles (html-directory)',
+    '/ip/hotspot/profile/print'       => 'Hotspot profiles (html-directory)',
 ];
 
 /**
