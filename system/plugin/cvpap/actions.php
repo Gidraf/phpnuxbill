@@ -616,7 +616,42 @@ function cvpap_act_diagnostics($q)
             'Not verifiable (the API user cannot list accounts — normal on a locked-down router)');
     }
 
-    // 9. Active sessions count (informational)
+    // 9. Bypass protection: catch config that lets people online WITHOUT paying.
+    // These are the settings that silently leak free internet - trial/MAC login,
+    // an over-broad walled-garden, or an internet-exposed config API.
+    try {
+        $issues = [];
+        foreach (cvpap_ros_rows($client, '/ip/hotspot/user/profile/print', '.id,name,shared-users') as $p) {
+            // informational only; shared-users handled per-plan by nuxbill
+        }
+        foreach (cvpap_ros_rows($client, '/ip/hotspot/profile/print', '.id,name,login-by') as $p) {
+            $lb = strtolower((string) ($p['login-by'] ?? ''));
+            if (strpos($lb, 'trial') !== false) { $issues[] = 'trial login is ON (gives free time without paying)'; }
+            // "mac" alone auto-logs-in any device; "mac-cookie" is fine (post-auth)
+            if (preg_match('/(^|,)mac($|,)/', $lb)) { $issues[] = 'MAC login is ON (devices get online without the pay-page)'; }
+        }
+        foreach (cvpap_ros_rows($client, '/ip/hotspot/walled-garden/ip/print', '.id,dst-address,action,disabled') as $w) {
+            if (($w['disabled'] ?? '') === 'true') { continue; }
+            $da = trim((string) ($w['dst-address'] ?? ''));
+            if (($w['action'] ?? 'accept') === 'accept' && ($da === '0.0.0.0/0' || $da === '0.0.0.0/1')) {
+                $issues[] = 'walled-garden allows ALL destinations (' . $da . ') - everyone is online free';
+            }
+        }
+        foreach (cvpap_ros_rows($client, '/ip/service/print', '.id,name,disabled,address') as $s) {
+            if (($s['name'] ?? '') === 'api' && ($s['disabled'] ?? '') !== 'true'
+                && trim((string) ($s['address'] ?? '')) === '') {
+                $issues[] = 'RouterOS API is reachable from any address (should be tunnel-only)';
+            }
+        }
+        $ok = count($issues) === 0;
+        $add('security', 'Bypass protection', $ok,
+            $ok ? 'No free-access misconfiguration found' : implode('; ', $issues),
+            $ok ? null : 'Re-import the current CVPAP config to restore the locked-down settings.');
+    } catch (Throwable $e) {
+        $add('security', 'Bypass protection', true, 'Not fully verifiable: ' . $e->getMessage());
+    }
+
+    // 10. Active sessions count (informational)
     try {
         $active = cvpap_ros_rows($client, '/ip/hotspot/active/print', '.id');
         $add('sessions', 'Active devices', true, count($active) . ' device(s) online now');
