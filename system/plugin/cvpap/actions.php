@@ -217,6 +217,164 @@ function cvpap_ros_rows($client, $apiPath, $proplist = null, $whereKey = null, $
  * dashboard act on a specific device/session (not just a username, which can
  * span several devices). Also maps username -> customer so the UI shows an owner.
  */
+/**
+ * Parse a RouterOS time string ("1h2m3s", "3d4h", "45m", "20s") to seconds.
+ */
+function cvpap_time_to_seconds($s)
+{
+    $s = trim((string) $s);
+    if ($s === '' || $s === 'none') { return 0; }
+    $total = 0;
+    if (preg_match_all('/(\d+)([wdhms])/', $s, $m, PREG_SET_ORDER)) {
+        $mult = ['w' => 604800, 'd' => 86400, 'h' => 3600, 'm' => 60, 's' => 1];
+        foreach ($m as $part) { $total += (int) $part[1] * ($mult[$part[2]] ?? 0); }
+    }
+    return $total;
+}
+
+function cvpap_signal_label($rssi)
+{
+    $rssi = (int) $rssi;
+    if ($rssi === 0) { return 'unknown'; }
+    if ($rssi >= -60) { return 'excellent'; }
+    if ($rssi >= -70) { return 'good'; }
+    if ($rssi >= -80) { return 'fair'; }
+    return 'weak';
+}
+
+/**
+ * VERY rough distance-from-AP estimate from RSSI (free-space path loss, 2.4GHz).
+ * Real-world walls/interference make this indicative only - use the label, not
+ * the metres, for decisions.
+ */
+function cvpap_rssi_to_meters($rssi)
+{
+    $rssi = (int) $rssi;
+    if ($rssi === 0) { return null; }
+    $freq = 2412; // MHz (assume 2.4GHz)
+    $exp = (27.55 - (20 * log10($freq)) + abs($rssi)) / 20.0;
+    return round(pow(10, $exp), 1);
+}
+
+/**
+ * Per-AP + performance analytics for one router: uptime, CPU/RAM, version, how
+ * many devices are on each AP (by bridge port), and per-client signal/distance
+ * when the radios are visible (MikroTik wireless / CAPsMAN). Powers the "where do
+ * I need another AP?" and "is the router healthy?" views.
+ */
+function cvpap_act_router_analytics($q)
+{
+    cvpap_require_params($q, ['router']);
+    cvpap_assert_router_in_scope($q, $q['router']);
+    $router = Mikrotik::info($q['router']);
+    if (!$router) {
+        throw new CvpapApiError('Router not found');
+    }
+    $client = Mikrotik::getClient($router['ip_address'], $router['username'], $router['password']);
+    if ($client === null) {
+        return ['demo' => true];
+    }
+    $out = ['router' => $q['router']];
+
+    // System / performance
+    $sys = cvpap_ros_rows($client, '/system/resource/print');
+    if (!empty($sys)) {
+        $r = $sys[0];
+        $out['system'] = [
+            'uptime' => $r['uptime'] ?? '',
+            'uptime_seconds' => cvpap_time_to_seconds($r['uptime'] ?? ''),
+            'cpu_load' => (int) ($r['cpu-load'] ?? 0),
+            'free_memory' => (int) ($r['free-memory'] ?? 0),
+            'total_memory' => (int) ($r['total-memory'] ?? 0),
+            'version' => $r['version'] ?? '',
+            'board' => $r['board-name'] ?? '',
+        ];
+    }
+
+    // Devices per AP: bridge hosts grouped by the physical port they arrived on.
+    // If each AP is on its own MikroTik port, on-interface == the AP.
+    $byPort = [];
+    foreach (cvpap_ros_rows($client, '/interface/bridge/host/print', '.id,mac-address,on-interface,local') as $h) {
+        if (($h['local'] ?? '') === 'true') { continue; }
+        $if = $h['on-interface'] ?? 'unknown';
+        $byPort[$if] = ($byPort[$if] ?? 0) + 1;
+    }
+    $clients_by_ap = [];
+    foreach ($byPort as $if => $n) {
+        $clients_by_ap[] = ['ap' => $if, 'devices' => $n];
+    }
+    $out['clients_by_ap'] = $clients_by_ap;
+
+    // Signal / distance — ONLY where radios are visible to this router.
+    $wifi = [];
+    foreach (['/interface/wireless/registration-table/print', '/caps-man/registration-table/print'] as $path) {
+        try {
+            foreach (cvpap_ros_rows($client, $path) as $w) {
+                $sig = $w['signal-strength'] ?? ($w['signal'] ?? '');
+                $rssi = 0;
+                if (preg_match('/-?\d+/', (string) $sig, $m)) { $rssi = (int) $m[0]; }
+                $wifi[] = [
+                    'mac' => $w['mac-address'] ?? '',
+                    'interface' => $w['interface'] ?? ($w['ssid'] ?? ''),
+                    'signal_dbm' => $rssi,
+                    'signal_label' => cvpap_signal_label($rssi),
+                    'distance_m' => cvpap_rssi_to_meters($rssi),
+                    'uptime' => $w['uptime'] ?? '',
+                ];
+            }
+        } catch (Throwable $e) {
+            // path not present on this router (no wireless / no CAPsMAN) — skip
+        }
+    }
+    $out['wireless_clients'] = $wifi;
+    $out['has_wireless_visibility'] = count($wifi) > 0;
+    $out['active_sessions'] = count(cvpap_ros_rows($client, '/ip/hotspot/active/print', '.id'));
+    return $out;
+}
+
+/**
+ * The live session status of ONE customer on a router: are they online right now,
+ * and how much time is left? Powers the portal's countdown + "top up before you
+ * run out" prompt so a customer never has to disconnect/reconnect.
+ */
+function cvpap_act_session_status($q)
+{
+    cvpap_require_params($q, ['router']);
+    cvpap_assert_router_in_scope($q, $q['router']);
+    $router = Mikrotik::info($q['router']);
+    if (!$router) {
+        throw new CvpapApiError('Router not found');
+    }
+    $client = Mikrotik::getClient($router['ip_address'], $router['username'], $router['password']);
+    if ($client === null) {
+        return ['active' => false, 'demo' => true];
+    }
+    $username = trim((string) cvpap_param($q, 'username', ''));
+    if ($username === '' && cvpap_param($q, 'phone', '') !== '') { $username = trim((string) $q['phone']); }
+    $mac = strtoupper(str_replace('-', ':', trim((string) cvpap_param($q, 'mac', ''))));
+
+    $rows = [];
+    if ($username !== '') {
+        $rows = cvpap_ros_rows($client, '/ip/hotspot/active/print', null, 'user', $username);
+    }
+    if (empty($rows) && $mac !== '') {
+        $rows = cvpap_ros_rows($client, '/ip/hotspot/active/print', null, 'mac-address', $mac);
+    }
+    if (empty($rows)) {
+        return ['active' => false, 'username' => $username];
+    }
+    $r = $rows[0];
+    return [
+        'active' => true,
+        'username' => $r['user'] ?? $username,
+        'mac' => $r['mac-address'] ?? '',
+        'address' => $r['address'] ?? '',
+        'uptime' => $r['uptime'] ?? '',
+        'time_left' => $r['session-time-left'] ?? '',
+        'time_left_seconds' => cvpap_time_to_seconds($r['session-time-left'] ?? ''),
+    ];
+}
+
 function cvpap_act_active_sessions($q)
 {
     cvpap_require_params($q, ['router']);
