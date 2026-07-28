@@ -804,7 +804,7 @@ function cvpap_act_diagnostics($q)
         $ok = count($issues) === 0;
         $add('security', 'Bypass protection', $ok,
             $ok ? 'No free-access misconfiguration found' : implode('; ', $issues),
-            $ok ? null : 'Re-import the current CVPAP config to restore the locked-down settings.');
+            $ok ? null : '/ip service set api address=' . '<tunnel>.0/24');
     } catch (Throwable $e) {
         $add('security', 'Bypass protection', true, 'Not fully verifiable: ' . $e->getMessage());
     }
@@ -841,8 +841,8 @@ function cvpap_act_apply_fix($q)
     cvpap_require_params($q, ['router', 'fix']);
     cvpap_assert_router_in_scope($q, $q['router']);
     $fix = preg_replace('/[^a-z0-9_]/', '', strtolower((string) $q['fix']));
-    if (!in_array($fix, ['nat', 'dns', 'hotspot', 'portal', 'loginpage'], true)) {
-        throw new CvpapApiError('Unknown fix — only nat, dns, hotspot, portal, loginpage are supported.');
+    if (!in_array($fix, ['nat', 'dns', 'hotspot', 'portal', 'loginpage', 'security'], true)) {
+        throw new CvpapApiError('Unknown fix — nat, dns, hotspot, portal, loginpage, security.');
     }
     $router = Mikrotik::info($q['router']);
     if (!$router) {
@@ -897,6 +897,40 @@ function cvpap_act_apply_fix($q)
             }
         }
         $applied[] = $enabled > 0 ? "Enabled $enabled hotspot server(s)" : 'Hotspot was already enabled';
+    } elseif ($fix === 'security') {
+        // Re-apply the bypass-protection lockdown: restrict the RouterOS API to
+        // the tunnel, disable unused management services, and strip any free-
+        // access hotspot login modes (trial/mac). Idempotent.
+        $lockAddr = ['api' => $tunnelNet . '.0/24'];
+        $disable = ['telnet' => 1, 'ftp' => 1, 'api-ssl' => 1, 'www-ssl' => 1];
+        foreach (cvpap_ros_rows($client, '/ip/service/print', '.id,name,address,disabled') as $s) {
+            $name = $s['name'] ?? '';
+            if (isset($lockAddr[$name]) && trim((string) ($s['address'] ?? '')) !== $lockAddr[$name]) {
+                $set = new PEAR2\Net\RouterOS\Request('/ip/service/set');
+                $set->setArgument('numbers', $s['.id']);
+                $set->setArgument('address', $lockAddr[$name]);
+                $client->sendSync($set);
+                $applied[] = "Locked $name to the tunnel (" . $lockAddr[$name] . ')';
+            }
+            if (isset($disable[$name]) && ($s['disabled'] ?? '') !== 'true') {
+                $set = new PEAR2\Net\RouterOS\Request('/ip/service/set');
+                $set->setArgument('numbers', $s['.id']);
+                $set->setArgument('disabled', 'yes');
+                $client->sendSync($set);
+                $applied[] = "Disabled unused service: $name";
+            }
+        }
+        foreach (cvpap_ros_rows($client, '/ip/hotspot/profile/print', '.id,name,login-by') as $p) {
+            $lb = strtolower((string) ($p['login-by'] ?? ''));
+            if (strpos($lb, 'trial') !== false || preg_match('/(^|,)mac($|,)/', $lb)) {
+                $set = new PEAR2\Net\RouterOS\Request('/ip/hotspot/profile/set');
+                $set->setArgument('numbers', $p['.id']);
+                $set->setArgument('login-by', 'http-pap');
+                $client->sendSync($set);
+                $applied[] = 'Removed free-access login (trial/MAC) from profile ' . ($p['name'] ?? '');
+            }
+        }
+        if (empty($applied)) { $applied[] = 'Already locked down — nothing to change'; }
     } elseif ($fix === 'portal') {
         $host = trim((string) cvpap_param($q, 'portal_host', ''));
         if ($host === '') {
