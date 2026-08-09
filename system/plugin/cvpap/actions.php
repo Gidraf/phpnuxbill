@@ -2221,8 +2221,19 @@ function cvpap_hotspot_autologin($router_name, $plan, $username, $password, $mac
         if ($client === null) {
             return ['ok' => false, 'skipped' => 'demo'];
         }
-        // clear any stale session for this user first so the fresh login sticks
-        try { Mikrotik::logMeOut($client, $username); } catch (Throwable $e) {}
+        // clear any stale session for this user, MAC or IP first so the fresh login sticks without 'already authorizing' locks
+        try {
+            Mikrotik::logMeOut($client, $username);
+            if ($mac !== '') {
+                foreach (cvpap_ros_rows($client, '/ip/hotspot/active/print', '.id', 'mac-address', $mac) as $r) {
+                    if (!empty($r['.id'])) {
+                        $rm = new PEAR2\Net\RouterOS\Request('/ip/hotspot/active/remove');
+                        $rm->setArgument('numbers', $r['.id']);
+                        $client->sendSync($rm);
+                    }
+                }
+            }
+        } catch (Throwable $e) {}
         Mikrotik::logMeIn($client, $username, $password, $ip, $mac);
         return ['ok' => true, 'mac' => $mac, 'ip' => $ip];
     } catch (Throwable $e) {
