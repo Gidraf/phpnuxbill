@@ -302,6 +302,14 @@ class Mikrotik
         $printRequest->setQuery(RouterOS\Query::where('name', $user));
         $id = $client->sendSync($printRequest)->getProperty('.id');
 
+        if (empty($id)) {
+            // User does not exist on the router — cannot set password.
+            // Throw so callers (e.g. cvpap_verify_hotspot_user) know the sync
+            // failed and can report it, rather than silently sending numbers=''
+            // to RouterOS (which is a no-op and hides the problem).
+            throw new \Exception("Hotspot user [$user] not found on router — cannot set password");
+        }
+
         $setRequest = new RouterOS\Request('/ip/hotspot/user/set');
         $setRequest->setArgument('numbers', $id);
         $setRequest->setArgument('password', $pass);

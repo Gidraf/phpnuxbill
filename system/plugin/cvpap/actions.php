@@ -2131,8 +2131,9 @@ function cvpap_verify_hotspot_user($router_name, $plan, $username, $password)
 
     // RouterOS can lag briefly right after recharge/customer create. Recheck a
     // few times so we do not mark paid purchases as failed during propagation.
+    // 6 attempts × 500ms = up to 3s total wait — enough for a slow tunnel.
     $id = '';
-    $attempts = 4;
+    $attempts = 6;
     for ($i = 0; $i < $attempts; $i++) {
         $printRequest = new PEAR2\Net\RouterOS\Request('/ip/hotspot/user/print');
         $printRequest->setArgument('.proplist', '.id');
@@ -2142,7 +2143,7 @@ function cvpap_verify_hotspot_user($router_name, $plan, $username, $password)
             break;
         }
         if ($i < $attempts - 1) {
-            usleep(400000);
+            usleep(500000); // 500ms
         }
     }
 
@@ -2153,10 +2154,16 @@ function cvpap_verify_hotspot_user($router_name, $plan, $username, $password)
         ];
     }
 
+    // Force the password to exactly what the DB has so MikroTik login always
+    // matches the credentials we hand back to the customer. We already have
+    // $id from the loop above — use it directly to avoid a second lookup race.
     try {
-        Mikrotik::setHotspotUser($client, $username, $password);
+        $setRequest = new PEAR2\Net\RouterOS\Request('/ip/hotspot/user/set');
+        $setRequest->setArgument('numbers', $id);
+        $setRequest->setArgument('password', $password);
+        $client->sendSync($setRequest);
     } catch (Throwable $e) {
-        return ['verified' => false, 'error' => $e->getMessage()];
+        return ['verified' => false, 'error' => 'password sync failed: ' . $e->getMessage()];
     }
 
     return ['verified' => true];
