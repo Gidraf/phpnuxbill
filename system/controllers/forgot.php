@@ -7,6 +7,35 @@
 $step = _req('step', 0);
 $otpPath = $CACHE_PATH . File::pathFixer('/forgot/');
 
+// Security (upstream GHSA-337r-rrrc-r559): the code file holds "<otp>|<attempts_left>"; every wrong
+// code uses one attempt and the code is destroyed after 5, so the 6-digit space cannot be brute-forced.
+// Returns true when the code is right; on a wrong code it redirects (and never returns).
+function forgot_check_code($otpPath, $otp_code, $maxAge = 1200)
+{
+    if (!file_exists($otpPath) || time() - filemtime($otpPath) > $maxAge) {
+        if (file_exists($otpPath)) {
+            unlink($otpPath);
+        }
+        r2(getUrl('forgot&step=1'), 'e', Lang::T('Invalid Username or Verification Code'));
+    }
+    $parts = explode('|', (string) file_get_contents($otpPath), 2);
+    $otp = $parts[0];
+    $attemptsLeft = isset($parts[1]) ? (int) $parts[1] : 5;
+    if ($otp !== '' && hash_equals((string) $otp, (string) $otp_code)) {
+        return true;
+    }
+    $attemptsLeft--;
+    if ($attemptsLeft <= 0) {
+        unlink($otpPath);
+        r2(getUrl('forgot&step=1'), 'e', Lang::T('Too many invalid attempts, please request a new Verification Code'));
+    }
+    $mtime = filemtime($otpPath);
+    file_put_contents($otpPath, $otp . '|' . $attemptsLeft);
+    @touch($otpPath, $mtime);
+    r2(getUrl('forgot&step=1'), 'e', Lang::T('Invalid Username or Verification Code'));
+    return false;
+}
+
 if ($step == '-1') {
     $_COOKIE['forgot_username'] = '';
     setcookie('forgot_username', '', time() - 3600, '/');
@@ -45,8 +74,8 @@ if ($step == 1) {
                 $ui->assign('notify', Lang::T("Verification Code already Sent to Your Phone/Email/Whatsapp, please wait")." $sec seconds.");
             } else {
                 $via = $config['user_notification_reminder'];
-                $otp = mt_rand(100000, 999999);
-                file_put_contents($otpPath, $otp);
+                $otp = random_int(100000, 999999);
+                file_put_contents($otpPath, $otp . '|5');
                 if ($via == 'sms' || $via == 'both') {
                     Message::sendSMS($user['phonenumber'], $config['CompanyName'] . " C0de: $otp");
                 }
@@ -82,23 +111,12 @@ if ($step == 1) {
     $otp_code = _req('otp_code');
     if (!empty($username) && !empty($otp_code)) {
         $otpPath .= sha1($username . $db_pass) . ".txt";
-        if (file_exists($otpPath) && time() - filemtime($otpPath) <= 1200) {
-            $otp = file_get_contents($otpPath);
-            if ($otp == $otp_code) {
-                $ui->assign('username', $username);
-                $ui->assign('otp_code', $otp_code);
-                $ui->assign('_title', Lang::T('Change Password'));
-                $ui->display('customer/forgot-set-password.tpl');
-                exit();
-            } else {
-                r2(getUrl('forgot&step=1'), 'e', Lang::T('Invalid Username or Verification Code'));
-            }
-        } else {
-            if (file_exists($otpPath)) {
-                unlink($otpPath);
-            }
-            r2(getUrl('forgot&step=1'), 'e', Lang::T('Invalid Username or Verification Code'));
-        }
+        forgot_check_code($otpPath, $otp_code);
+        $ui->assign('username', $username);
+        $ui->assign('otp_code', $otp_code);
+        $ui->assign('_title', Lang::T('Change Password'));
+        $ui->display('customer/forgot-set-password.tpl');
+        exit();
     } else {
         r2(getUrl('forgot&step=1'), 'e', Lang::T('Invalid Username or Verification Code'));
     }
@@ -109,15 +127,10 @@ if ($step == 1) {
     $password = _post('password');
     $cpassword = _post('cpassword');
     $otpPath .= sha1($username . $db_pass) . ".txt";
-    $valid = !empty($username) && !empty($otp_code)
-        && file_exists($otpPath) && time() - filemtime($otpPath) <= 1200
-        && file_get_contents($otpPath) == $otp_code;
-    if (!$valid) {
-        if (file_exists($otpPath)) {
-            unlink($otpPath);
-        }
+    if (empty($username) || empty($otp_code)) {
         r2(getUrl('forgot&step=1'), 'e', Lang::T('Invalid Username or Verification Code'));
     }
+    forgot_check_code($otpPath, $otp_code);
     if (!Validator::Length($password, 36, 5)) {
         $ui->assign('username', $username);
         $ui->assign('otp_code', $otp_code);
