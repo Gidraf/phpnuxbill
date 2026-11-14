@@ -1,6 +1,13 @@
 # Use the official PHP image with Apache
 FROM php:7.4-apache
 EXPOSE 80
+# Debian 11 (bullseye, under php:7.4) is past its support: its packages moved to archive.debian.org
+# and deb.debian.org now answers 404. Read them from the archive (no Valid-Until: archived releases expire).
+RUN sed -i -e 's|deb.debian.org/debian-security|archive.debian.org/debian-security|g' \
+           -e 's|deb.debian.org/debian|archive.debian.org/debian|g' \
+           -e '/bullseye-updates/d' /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null || true; \
+    echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99archive
+
 # Install necessary PHP extensions
 RUN apt-get update && apt-get install -y \
     libfreetype6-dev \
